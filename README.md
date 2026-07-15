@@ -36,6 +36,7 @@ https://spark.lucko.me/02pGFymGbD
 - `max_hotspots`：保留的热点数量，默认 20；先保证每个选中线程有代表热点，剩余名额按全局自耗采样值选择。
 - `max_threads`：最多参与摘要的线程数量，默认 8；选择器在该上限和 `max_hotspots` 上限下联合最大化可解释自耗采样，无可用自耗热点的线程不会占用名额。
 - `max_concurrent_analyses`：同时进行的 Spark 分析任务数量，默认 2；用于限制大型 profile 的 CPU、内存和线程池压力。
+- `max_pending_analyses`：运行中或排队中的分析任务总数，默认 16；达到上限后跳过新任务，避免不同链接持续堆积内存。
 - `request_timeout_seconds`：Spark 请求超时，默认 60 秒。
 
 当 `llm_providers` 留空时，插件使用当前会话的 AstrBot Provider。配置多个 Provider 时，插件会按列表顺序尝试，第一个成功的结果会被采用。

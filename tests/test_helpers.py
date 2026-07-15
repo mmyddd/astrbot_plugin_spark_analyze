@@ -476,6 +476,7 @@ class HelperTests(unittest.TestCase):
                 "max_hotspots": 0,
                 "max_threads": 999,
                 "max_concurrent_analyses": 999,
+                "max_pending_analyses": 999,
                 "request_timeout_seconds": "12.5",
             }
         )
@@ -495,6 +496,7 @@ class HelperTests(unittest.TestCase):
             config.max_concurrent_analyses,
             main.MAX_CONCURRENT_ANALYSES,
         )
+        self.assertEqual(config.max_pending_analyses, main.MAX_PENDING_ANALYSES)
         self.assertEqual(config.request_timeout_seconds, 12.5)
 
     def test_fetch_spark_profile_validates_content_type_and_reads_bytes(self):
@@ -1097,6 +1099,24 @@ class HelperTests(unittest.TestCase):
             plugin._analysis_semaphore.release()
             await waiting
             plugin._analysis_semaphore.release()
+
+        asyncio.run(exercise())
+
+    def test_plugin_limits_pending_analysis_admission(self):
+        plugin = main.SparkAnalyzePlugin(
+            FakeContext(),
+            {
+                "max_concurrent_analyses": 1,
+                "max_pending_analyses": 1,
+            },
+        )
+
+        async def exercise():
+            self.assertTrue(await plugin._claim_pending_analysis())
+            self.assertFalse(await plugin._claim_pending_analysis())
+            await plugin._release_pending_analysis()
+            self.assertTrue(await plugin._claim_pending_analysis())
+            await plugin._release_pending_analysis()
 
         asyncio.run(exercise())
 

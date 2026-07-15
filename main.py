@@ -31,6 +31,7 @@ DEFAULT_MAX_SUMMARY_CHARS = 60000
 DEFAULT_MAX_HOTSPOTS = 20
 DEFAULT_MAX_THREADS = 8
 DEFAULT_MAX_CONCURRENT_ANALYSES = 2
+DEFAULT_MAX_PENDING_ANALYSES = 16
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_MAX_TOKENS = 4096
@@ -41,6 +42,7 @@ MAX_SUMMARY_CHARS = 200000
 MAX_HOTSPOTS = 100
 MAX_THREADS = 64
 MAX_CONCURRENT_ANALYSES = 8
+MAX_PENDING_ANALYSES = 64
 MAX_REQUEST_TIMEOUT_SECONDS = 300
 MAX_LLM_TIMEOUT_SECONDS = 600
 MAX_LLM_MAX_TOKENS = 32768
@@ -178,6 +180,7 @@ class SparkAnalyzeConfig:
     max_hotspots: int = DEFAULT_MAX_HOTSPOTS
     max_threads: int = DEFAULT_MAX_THREADS
     max_concurrent_analyses: int = DEFAULT_MAX_CONCURRENT_ANALYSES
+    max_pending_analyses: int = DEFAULT_MAX_PENDING_ANALYSES
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     @classmethod
@@ -252,6 +255,16 @@ class SparkAnalyzeConfig:
                 DEFAULT_MAX_CONCURRENT_ANALYSES,
                 1,
                 MAX_CONCURRENT_ANALYSES,
+            ),
+            max_pending_analyses=_bounded_int(
+                _config_get(
+                    raw,
+                    "max_pending_analyses",
+                    DEFAULT_MAX_PENDING_ANALYSES,
+                ),
+                DEFAULT_MAX_PENDING_ANALYSES,
+                1,
+                MAX_PENDING_ANALYSES,
             ),
             request_timeout_seconds=_bounded_float(
                 _config_get(
@@ -1551,6 +1564,8 @@ class SparkAnalyzePlugin(Star):
         self._in_flight_codes: set[str] = set()
         self._in_flight_lock = asyncio.Lock()
         self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_analysis_count = 0
+        self._pending_analysis_lock = asyncio.Lock()
         self._analysis_semaphore = asyncio.Semaphore(
             self.config.max_concurrent_analyses
         )
@@ -1578,6 +1593,23 @@ class SparkAnalyzePlugin(Star):
         async with self._in_flight_lock:
             self._in_flight_codes.discard(code)
 
+    async def _claim_pending_analysis(self) -> bool:
+        async with self._pending_analysis_lock:
+            if (
+                self._pending_analysis_count
+                >= self.config.max_pending_analyses
+            ):
+                return False
+            self._pending_analysis_count += 1
+            return True
+
+    async def _release_pending_analysis(self) -> None:
+        async with self._pending_analysis_lock:
+            self._pending_analysis_count = max(
+                self._pending_analysis_count - 1,
+                0,
+            )
+
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(
         self,
@@ -1587,6 +1619,7 @@ class SparkAnalyzePlugin(Star):
         if current_task is not None:
             self._active_tasks.add(current_task)
         result: Comp.Nodes | None = None
+        pending_claimed = False
         try:
             if self._terminating:
                 return
@@ -1603,6 +1636,13 @@ class SparkAnalyzePlugin(Star):
             if link is None:
                 return
 
+            if not await self._claim_pending_analysis():
+                logger.debug(
+                    "[SparkAnalyze] 分析任务已达到排队上限，跳过：code=%s",
+                    link.code,
+                )
+                return
+            pending_claimed = True
             logger.debug(
                 "[SparkAnalyze] 识别到 Spark profile 链接：url=%s, code=%s, group_id=%s",
                 link.url,
@@ -1686,6 +1726,8 @@ class SparkAnalyzePlugin(Star):
             )
             return
         finally:
+            if pending_claimed:
+                await self._release_pending_analysis()
             if current_task is not None:
                 self._active_tasks.discard(current_task)
 
@@ -1739,3 +1781,5 @@ class SparkAnalyzePlugin(Star):
 
             async with self._in_flight_lock:
                 self._in_flight_codes.clear()
+            async with self._pending_analysis_lock:
+                self._pending_analysis_count = 0

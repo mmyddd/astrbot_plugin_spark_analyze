@@ -165,6 +165,12 @@
     "default": 2,
     "hint": "用于限制 CPU、内存和线程池压力，插件内部上限 8。"
   },
+  "max_pending_analyses": {
+    "description": "运行中或排队中的 Spark 分析任务总数。",
+    "type": "int",
+    "default": 16,
+    "hint": "达到上限后跳过新任务，插件内部上限 64。"
+  },
   "request_timeout_seconds": {
     "description": "Spark 原始 profile 和 JSON service 请求超时时间，单位为秒。",
     "type": "float",
