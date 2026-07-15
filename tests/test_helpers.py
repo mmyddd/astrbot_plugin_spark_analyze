@@ -339,6 +339,12 @@ class HelperTests(unittest.TestCase):
             main.extract_spark_profile_link("https://spark.lucko.me/abc/extra")
         )
         self.assertIsNone(
+            main.extract_spark_profile_link("xhttps://spark.lucko.me/abc123")
+        )
+        self.assertIsNone(
+            main.extract_spark_profile_link("https://spark.lucko.me/abc123?full=true")
+        )
+        self.assertIsNone(
             main.extract_spark_profile_link(
                 "https://spark.lucko.me/abc123 https://spark.lucko.me/def456"
             )
@@ -404,7 +410,75 @@ class HelperTests(unittest.TestCase):
         self.assertIn("Test Mod@1.2.3", summary)
         self.assertIn("com.example.TestMod.tick:10", summary)
         self.assertIn("source=testmod", summary)
-        self.assertIn("第三方 source 热点聚合", summary)
+        self.assertIn("第三方 source 自耗热点聚合", summary)
+        self.assertIn("testmod: 20.00%", summary)
+        self.assertNotIn("testmod: 80.00%", summary)
+
+    def test_summarize_profile_uses_platform_spark_version_fallback(self):
+        profile = sample_profile()
+        del profile["metadata"]["sources"]["spark"]
+
+        summary = main.summarize_spark_profile(profile)
+
+        self.assertIn("spark 版本：2", summary)
+
+    def test_summarize_profile_counts_shared_nodes_once(self):
+        profile = sample_profile()
+        profile["metadata"]["sources"] = {
+            "sharedmod": {
+                "name": "Shared Mod",
+                "version": "1.0.0",
+                "builtIn": False,
+            }
+        }
+        profile["classSources"] = {
+            "mod.Root": "sharedmod",
+            "mod.Left": "sharedmod",
+            "mod.Right": "sharedmod",
+            "mod.Leaf": "sharedmod",
+        }
+        profile["threads"] = [
+            {
+                "name": "Server thread",
+                "times": [10],
+                "childrenRefs": [0],
+                "children": [
+                    {
+                        "className": "mod.Root",
+                        "methodName": "root",
+                        "times": [10],
+                        "childrenRefs": [1, 2],
+                    },
+                    {
+                        "className": "mod.Left",
+                        "methodName": "left",
+                        "times": [10],
+                        "childrenRefs": [3],
+                    },
+                    {
+                        "className": "mod.Right",
+                        "methodName": "right",
+                        "times": [10],
+                        "childrenRefs": [3],
+                    },
+                    {
+                        "className": "mod.Leaf",
+                        "methodName": "leaf",
+                        "times": [10],
+                        "childrenRefs": [],
+                    },
+                ],
+            }
+        ]
+
+        summary = main.summarize_spark_profile(
+            profile,
+            max_hotspots=10,
+            max_chars=10000,
+        )
+
+        self.assertEqual(summary.count("mod.Leaf.leaf"), 1)
+        self.assertIn("sharedmod: 100.00%", summary)
 
     def test_analysis_prompt_requires_evidence_and_limits_hallucination(self):
         prompt = main.build_analysis_prompt(
@@ -545,6 +619,33 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(context.generate_calls, [])
         asyncio.run(plugin.terminate())
 
+    def test_terminate_waits_for_active_task_and_clears_in_flight_codes(self):
+        plugin = main.SparkAnalyzePlugin(FakeContext())
+        plugin._in_flight_codes.add("abc123")
+
+        async def exercise():
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def active_worker():
+                task = asyncio.current_task()
+                plugin._active_tasks.add(task)
+                started.set()
+                await release.wait()
+                plugin._active_tasks.discard(task)
+
+            worker = asyncio.create_task(active_worker())
+            await started.wait()
+            terminating = asyncio.create_task(plugin.terminate())
+            await asyncio.sleep(0)
+            self.assertFalse(terminating.done())
+            release.set()
+            await worker
+            await terminating
+
+        asyncio.run(exercise())
+        self.assertEqual(plugin._in_flight_codes, set())
+
     def test_provider_falls_back_to_astrbot_when_openai_config_is_invalid(self):
         context = FakeContext()
         client = types.SimpleNamespace()
@@ -561,6 +662,34 @@ class HelperTests(unittest.TestCase):
                             "name": "Invalid",
                             "api_key": "",
                             "base_url": "",
+                        },
+                        {
+                            "__template_key": "astrbot_provider",
+                            "name": "Fallback",
+                        },
+                    ]
+                },
+                client,
+            )
+        )
+
+        self.assertIn("性能分析结果", result)
+        self.assertEqual(context.provider_calls, ["umo://group/12345"])
+
+    def test_provider_falls_back_when_template_is_unknown(self):
+        context = FakeContext()
+        client = types.SimpleNamespace()
+
+        result = asyncio.run(
+            main.generate_analysis(
+                context,
+                FakeEvent([]),
+                "prompt",
+                {
+                    "llm_providers": [
+                        {
+                            "__template_key": "unsupported",
+                            "name": "Unsupported",
                         },
                         {
                             "__template_key": "astrbot_provider",

@@ -12,7 +12,7 @@ https://spark.lucko.me/02pGFymGbD
 
 1. 从 Spark bytebin 下载并校验原始 `sparkprofile`。
 2. 从官方 JSON service 获取完整采样数据。
-3. 提取平台信息、TPS/MSPT、内存、Mod/source、线程热点和调用路径。
+3. 提取平台信息、TPS/MSPT、内存、Mod/source、线程自耗热点和调用路径；调用树中的共享节点只统计一次，避免祖先/子节点重复计数。
 4. 使用配置的 LLM Provider 生成中文性能诊断。
 5. 通过合并转发回复来源群。
 

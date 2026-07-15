@@ -16,7 +16,8 @@ from astrbot.api.star import Context, Star
 
 
 SPARK_LINK_PATTERN = re.compile(
-    r"https://spark\.lucko\.me/([A-Za-z0-9]{4,64})(?![A-Za-z0-9/])"
+    r"(?<![A-Za-z0-9])https://spark\.lucko\.me/"
+    r"([A-Za-z0-9]{4,64})(?![A-Za-z0-9/?#])"
 )
 SPARK_RAW_BASE_URL = "https://spark-usercontent.lucko.me"
 SPARK_JSON_BASE_URL = "https://spark-json-service.lucko.me"
@@ -30,6 +31,7 @@ DEFAULT_MAX_HOTSPOTS = 20
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_MAX_TOKENS = 4096
+DEFAULT_TERMINATE_WAIT_SECONDS = 10
 MAX_PROFILE_BYTES = 50 * 1024 * 1024
 MAX_JSON_BYTES = 50 * 1024 * 1024
 MAX_SUMMARY_CHARS = 200000
@@ -37,6 +39,9 @@ MAX_HOTSPOTS = 100
 MAX_REQUEST_TIMEOUT_SECONDS = 300
 MAX_LLM_TIMEOUT_SECONDS = 600
 MAX_LLM_MAX_TOKENS = 32768
+MAX_PROFILE_TREE_NODES = 250000
+
+OPENAI_COMPATIBLE_TEMPLATES = frozenset({"openai_compatible", "modelscope"})
 
 PARSED_MESSAGE_EMOJI_ID = 289
 PARSED_MESSAGE_EMOJI_TYPE = "1"
@@ -331,6 +336,50 @@ def _sum_times(value: object) -> float:
     return sum(_safe_float(item) for item in value)
 
 
+def _times_vector(value: object) -> list[float]:
+    if isinstance(value, list):
+        return [_safe_float(item) for item in value]
+    if value is None:
+        return []
+    return [_safe_float(value)]
+
+
+def _exclusive_times(
+    node: Mapping[str, Any],
+    nodes: list[object],
+) -> float:
+    own_times = _times_vector(node.get("times"))
+    if not own_times:
+        return 0.0
+
+    child_refs = node.get("childrenRefs")
+    if not isinstance(child_refs, list):
+        return sum(max(value, 0.0) for value in own_times)
+
+    child_totals = [0.0] * len(own_times)
+    seen_refs: set[int] = set()
+    for child_ref in child_refs:
+        if (
+            not isinstance(child_ref, int)
+            or child_ref < 0
+            or child_ref >= len(nodes)
+            or child_ref in seen_refs
+        ):
+            continue
+        seen_refs.add(child_ref)
+        raw_child = nodes[child_ref]
+        if not isinstance(raw_child, dict):
+            continue
+        values = _times_vector(raw_child.get("times"))
+        for index, value in enumerate(values[: len(own_times)]):
+            child_totals[index] += value
+
+    return sum(
+        max(own_value - child_totals[index], 0.0)
+        for index, own_value in enumerate(own_times)
+    )
+
+
 def _format_number(value: object, digits: int = 2) -> str:
     number = _safe_float(value)
     if number.is_integer():
@@ -379,39 +428,68 @@ def _collect_thread_hotspots(
     root_refs = thread.get("childrenRefs")
     if not isinstance(nodes, list) or not isinstance(root_refs, list):
         return [], _sum_times(thread.get("times"))
+    if len(nodes) > MAX_PROFILE_TREE_NODES:
+        raise SparkFetchError(
+            "Spark 线程采样树节点数超过限制："
+            f"{len(nodes)} > {MAX_PROFILE_TREE_NODES}"
+        )
 
-    hotspots: list[Hotspot] = []
+    # Spark stores the call tree as a shared-reference graph. Walk each node
+    # once, keep one representative root-to-node path, and derive self time by
+    # subtracting the unique direct children from the inclusive node samples.
+    paths: dict[int, list[str]] = {}
+    queue: list[int] = []
+    for root_ref in root_refs:
+        if (
+            isinstance(root_ref, int)
+            and 0 <= root_ref < len(nodes)
+            and root_ref not in paths
+            and isinstance(nodes[root_ref], dict)
+        ):
+            paths[root_ref] = [_node_label(nodes[root_ref])]
+            queue.append(root_ref)
 
-    def visit(ref: object, labels: list[str], ref_stack: set[int]) -> None:
-        if not isinstance(ref, int) or ref < 0 or ref >= len(nodes):
-            return
-        if ref in ref_stack:
-            return
+    cursor = 0
+    while cursor < len(queue):
+        ref = queue[cursor]
+        cursor += 1
         raw_node = nodes[ref]
         if not isinstance(raw_node, dict):
-            return
+            continue
+        child_refs = raw_node.get("childrenRefs")
+        if not isinstance(child_refs, list):
+            continue
+        for child_ref in child_refs:
+            if (
+                not isinstance(child_ref, int)
+                or child_ref < 0
+                or child_ref >= len(nodes)
+                or child_ref in paths
+                or not isinstance(nodes[child_ref], dict)
+            ):
+                continue
+            paths[child_ref] = [
+                *paths[ref][-7:],
+                _node_label(nodes[child_ref]),
+            ]
+            queue.append(child_ref)
 
-        label = _node_label(raw_node)
-        next_labels = [*labels, label]
-        score = _sum_times(raw_node.get("times"))
+    hotspots: list[Hotspot] = []
+    for ref, labels in paths.items():
+        raw_node = nodes[ref]
+        if not isinstance(raw_node, dict):
+            continue
+        score = _exclusive_times(raw_node, nodes)
+        if score <= 0:
+            continue
         hotspots.append(
             Hotspot(
-                path=" -> ".join(next_labels[-8:]),
+                path=" -> ".join(labels[-8:]),
                 score=score,
                 share=0.0,
                 source=_node_source(raw_node, class_sources),
             )
         )
-
-        child_refs = raw_node.get("childrenRefs")
-        if not isinstance(child_refs, list):
-            return
-        next_stack = {*ref_stack, ref}
-        for child_ref in child_refs:
-            visit(child_ref, next_labels, next_stack)
-
-    for root_ref in root_refs:
-        visit(root_ref, [], set())
 
     thread_total = _sum_times(thread.get("times"))
     if thread_total > 0:
@@ -495,10 +573,13 @@ def summarize_spark_profile(
     if isinstance(spark_source, dict):
         spark_version = spark_source.get("version") or metadata.get(
             "sparkVersion",
-            "未知",
+            platform.get("sparkVersion", "未知"),
         )
     else:
-        spark_version = metadata.get("sparkVersion", "未知")
+        spark_version = metadata.get(
+            "sparkVersion",
+            platform.get("sparkVersion", "未知"),
+        )
 
     lines = [
         "Spark profile 结构化摘要",
@@ -569,7 +650,8 @@ def summarize_spark_profile(
 
     all_hotspots.sort(key=lambda item: item.score, reverse=True)
     lines.append(
-        f"采样热点（全线程累计采样值={_format_number(total_sample_score)}）："
+        "采样自耗热点（每个调用树节点只计一次自耗时，"
+        f"全线程累计采样值={_format_number(total_sample_score)}）："
     )
     for index, hotspot in enumerate(all_hotspots[:max_hotspots], start=1):
         source_text = f"，source={hotspot.source}" if hotspot.source else ""
@@ -588,7 +670,7 @@ def summarize_spark_profile(
             third_party_scores[source] = (
                 third_party_scores.get(source, 0.0) + hotspot.score
             )
-    lines.append("第三方 source 热点聚合：")
+    lines.append("第三方 source 自耗热点聚合：")
     if third_party_scores and total_sample_score > 0:
         for index, (source, score) in enumerate(
             sorted(third_party_scores.items(), key=lambda item: item[1], reverse=True)[
@@ -774,13 +856,15 @@ async def generate_analysis(
             )
             if template == "astrbot_provider":
                 text = await _call_astrbot_provider(context, event, prompt)
-            else:
+            elif template in OPENAI_COMPATIBLE_TEMPLATES:
                 text = await _call_openai_compatible(
                     client,
                     prompt,
                     provider,
                     config,
                 )
+            else:
+                raise ValueError(f"不支持的 Provider 模板：{template or '未知'}")
             logger.info("[SparkAnalyze] Provider 分析成功：%s", provider_name)
             return text
         except Exception as error:
@@ -825,18 +909,24 @@ def _build_forward_nodes(
 class SparkAnalyzePlugin(Star):
     def __init__(self, context: Context, config: object = None):
         super().__init__(context)
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self._http_client: httpx.AsyncClient | None = None
+        self._http_client_lock = asyncio.Lock()
         self._in_flight_codes: set[str] = set()
         self._in_flight_lock = asyncio.Lock()
+        self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._terminating = False
 
     async def initialize(self) -> None:
-        """Initialize shared plugin resources lazily on first request."""
+        self._terminating = False
 
     async def _get_http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = _build_http_client()
-        return self._http_client
+        async with self._http_client_lock:
+            if self._terminating:
+                raise RuntimeError("Spark 分析插件正在终止")
+            if self._http_client is None or self._http_client.is_closed:
+                self._http_client = _build_http_client()
+            return self._http_client
 
     async def _claim_code(self, code: str) -> bool:
         async with self._in_flight_lock:
@@ -854,121 +944,189 @@ class SparkAnalyzePlugin(Star):
         self,
         event: AstrMessageEvent,
     ) -> AsyncIterator[object]:
-        group_id = _get_group_id(event)
-        whitelist = _config_get(self.config, "enabled_group_ids", [])
-        if not is_group_allowed(group_id, whitelist):
-            return
-
-        messages = _get_message_segments(event)
-        if len(messages) != 1 or not isinstance(messages[0], Comp.Plain):
-            return
-
-        link = extract_spark_profile_link(getattr(messages[0], "text", ""))
-        if link is None:
-            return
-
-        logger.info(
-            "[SparkAnalyze] 识别到 Spark profile 链接：url=%s, code=%s, group_id=%s",
-            link.url,
-            link.code,
-            group_id,
-        )
-        event.stop_event()
-        await _react_to_parsed_message(event)
-
-        if not await self._claim_code(link.code):
-            logger.info(
-                "[SparkAnalyze] code 已在分析中，跳过重复任务：code=%s",
-                link.code,
-            )
-            return
-
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_tasks.add(current_task)
+        result: Comp.Nodes | None = None
         try:
-            max_profile_bytes = _bounded_config_int(
-                self.config,
-                "max_profile_bytes",
-                DEFAULT_MAX_PROFILE_BYTES,
-                1024,
-                MAX_PROFILE_BYTES,
-            )
-            max_json_bytes = _bounded_config_int(
-                self.config,
-                "max_json_bytes",
-                DEFAULT_MAX_JSON_BYTES,
-                1024,
-                MAX_JSON_BYTES,
-            )
-            max_summary_chars = _bounded_config_int(
-                self.config,
-                "max_summary_chars",
-                DEFAULT_MAX_SUMMARY_CHARS,
-                1000,
-                MAX_SUMMARY_CHARS,
-            )
-            max_hotspots = _bounded_config_int(
-                self.config,
-                "max_hotspots",
-                DEFAULT_MAX_HOTSPOTS,
-                1,
-                MAX_HOTSPOTS,
-            )
-            request_timeout_seconds = _bounded_config_float(
-                self.config,
-                "request_timeout_seconds",
-                DEFAULT_REQUEST_TIMEOUT_SECONDS,
-                1,
-                MAX_REQUEST_TIMEOUT_SECONDS,
-            )
+            if self._terminating:
+                return
 
-            client = await self._get_http_client()
-            await fetch_spark_profile(
+            group_id = _get_group_id(event)
+            whitelist = _config_get(self.config, "enabled_group_ids", [])
+            if not is_group_allowed(group_id, whitelist):
+                return
+
+            messages = _get_message_segments(event)
+            if len(messages) != 1 or not isinstance(messages[0], Comp.Plain):
+                return
+
+            link = extract_spark_profile_link(getattr(messages[0], "text", ""))
+            if link is None:
+                return
+
+            logger.info(
+                "[SparkAnalyze] 识别到 Spark profile 链接：url=%s, code=%s, group_id=%s",
+                link.url,
                 link.code,
-                max_bytes=max_profile_bytes,
-                timeout_seconds=request_timeout_seconds,
-                client=client,
+                group_id,
             )
-            profile = await fetch_spark_json(
-                link.code,
-                max_bytes=max_json_bytes,
-                timeout_seconds=request_timeout_seconds,
-                client=client,
-            )
-            summary = summarize_spark_profile(
-                profile,
-                max_hotspots=max_hotspots,
-                max_chars=max_summary_chars,
-            )
-            sender = _sender_text(event)
-            prompt = build_analysis_prompt(
-                code=link.code,
-                source_url=link.url,
-                sender=sender,
-                summary=summary,
-            )
-            analysis = await generate_analysis(
-                self.context,
-                event,
-                prompt,
-                self.config,
-                client,
-            )
-            result = _build_forward_nodes(
-                code=link.code,
-                source_url=link.url,
-                sender=sender,
-                analysis=analysis,
-            )
+            event.stop_event()
+            await _react_to_parsed_message(event)
+
+            if not await self._claim_code(link.code):
+                logger.info(
+                    "[SparkAnalyze] code 已在分析中，跳过重复任务：code=%s",
+                    link.code,
+                )
+                return
+
+            try:
+                max_profile_bytes = _bounded_config_int(
+                    self.config,
+                    "max_profile_bytes",
+                    DEFAULT_MAX_PROFILE_BYTES,
+                    1024,
+                    MAX_PROFILE_BYTES,
+                )
+                max_json_bytes = _bounded_config_int(
+                    self.config,
+                    "max_json_bytes",
+                    DEFAULT_MAX_JSON_BYTES,
+                    1024,
+                    MAX_JSON_BYTES,
+                )
+                max_summary_chars = _bounded_config_int(
+                    self.config,
+                    "max_summary_chars",
+                    DEFAULT_MAX_SUMMARY_CHARS,
+                    1000,
+                    MAX_SUMMARY_CHARS,
+                )
+                max_hotspots = _bounded_config_int(
+                    self.config,
+                    "max_hotspots",
+                    DEFAULT_MAX_HOTSPOTS,
+                    1,
+                    MAX_HOTSPOTS,
+                )
+                request_timeout_seconds = _bounded_config_float(
+                    self.config,
+                    "request_timeout_seconds",
+                    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                    1,
+                    MAX_REQUEST_TIMEOUT_SECONDS,
+                )
+
+                client = await self._get_http_client()
+                raw_profile = await fetch_spark_profile(
+                    link.code,
+                    max_bytes=max_profile_bytes,
+                    timeout_seconds=request_timeout_seconds,
+                    client=client,
+                )
+                if not raw_profile:
+                    raise SparkFetchError("Spark profile 响应为空")
+                logger.info(
+                    "[SparkAnalyze] 已下载 Spark profile：code=%s, bytes=%s",
+                    link.code,
+                    len(raw_profile),
+                )
+                profile = await fetch_spark_json(
+                    link.code,
+                    max_bytes=max_json_bytes,
+                    timeout_seconds=request_timeout_seconds,
+                    client=client,
+                )
+                summary = summarize_spark_profile(
+                    profile,
+                    max_hotspots=max_hotspots,
+                    max_chars=max_summary_chars,
+                )
+                sender = _sender_text(event)
+                prompt = build_analysis_prompt(
+                    code=link.code,
+                    source_url=link.url,
+                    sender=sender,
+                    summary=summary,
+                )
+                analysis = await generate_analysis(
+                    self.context,
+                    event,
+                    prompt,
+                    self.config,
+                    client,
+                )
+                result = _build_forward_nodes(
+                    code=link.code,
+                    source_url=link.url,
+                    sender=sender,
+                    analysis=analysis,
+                )
+            except Exception:
+                logger.exception(
+                    "[SparkAnalyze] 处理 Spark profile 失败：code=%s",
+                    link.code,
+                )
+                return
+            finally:
+                await self._release_code(link.code)
         except Exception:
             logger.exception(
-                "[SparkAnalyze] 处理 Spark profile 失败：code=%s",
-                link.code,
+                "[SparkAnalyze] 处理群消息时发生异常",
             )
             return
         finally:
-            await self._release_code(link.code)
+            if current_task is not None:
+                self._active_tasks.discard(current_task)
 
-        yield event.chain_result([result])
+        if result is not None:
+            yield event.chain_result([result])
 
     async def terminate(self) -> None:
-        if self._http_client is not None and not self._http_client.is_closed:
-            await self._http_client.aclose()
+        self._terminating = True
+        current_task = asyncio.current_task()
+        active_tasks = [
+            task
+            for task in self._active_tasks
+            if task is not current_task and not task.done()
+        ]
+        client: httpx.AsyncClient | None = None
+        try:
+            if active_tasks:
+                done_tasks, pending_tasks = await asyncio.wait(
+                    active_tasks,
+                    timeout=DEFAULT_TERMINATE_WAIT_SECONDS,
+                )
+                if done_tasks:
+                    await asyncio.gather(*done_tasks, return_exceptions=True)
+                if pending_tasks:
+                    logger.warning(
+                        "[SparkAnalyze] 终止时仍有 %s 个分析任务未结束，开始取消",
+                        len(pending_tasks),
+                    )
+                    for task in pending_tasks:
+                        task.cancel()
+                    cancelled_tasks, still_pending = await asyncio.wait(
+                        pending_tasks,
+                        timeout=1,
+                    )
+                    if cancelled_tasks:
+                        await asyncio.gather(
+                            *cancelled_tasks,
+                            return_exceptions=True,
+                        )
+                    if still_pending:
+                        logger.warning(
+                            "[SparkAnalyze] 仍有 %s 个分析任务未响应取消",
+                            len(still_pending),
+                        )
+        finally:
+            async with self._http_client_lock:
+                client = self._http_client
+                self._http_client = None
+            if client is not None and not client.is_closed:
+                await client.aclose()
+
+            async with self._in_flight_lock:
+                self._in_flight_codes.clear()
