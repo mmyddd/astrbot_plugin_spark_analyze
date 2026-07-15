@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import re
 from collections.abc import AsyncIterator, Mapping
@@ -1569,10 +1571,50 @@ class SparkAnalyzePlugin(Star):
         self._analysis_semaphore = asyncio.Semaphore(
             self.config.max_concurrent_analyses
         )
+        self._summary_executor: ThreadPoolExecutor | None = (
+            ThreadPoolExecutor(
+                max_workers=self.config.max_concurrent_analyses,
+                thread_name_prefix="spark-analyze",
+            )
+        )
+        self._summary_futures: set[asyncio.Future[Any]] = set()
+        self._termination_incomplete = False
         self._terminating = False
 
     async def initialize(self) -> None:
+        if self._termination_incomplete or self._summary_futures:
+            raise RuntimeError("Spark 分析任务仍在退出，插件不可复用")
+        if self._summary_executor is None:
+            self._summary_executor = ThreadPoolExecutor(
+                max_workers=self.config.max_concurrent_analyses,
+                thread_name_prefix="spark-analyze",
+            )
+        self._analysis_semaphore = asyncio.Semaphore(
+            self.config.max_concurrent_analyses
+        )
         self._terminating = False
+
+    async def _summarize_profile(
+        self,
+        profile: Mapping[str, Any],
+    ) -> str:
+        executor = self._summary_executor
+        if executor is None:
+            raise RuntimeError("Spark 摘要线程池不可用")
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            executor,
+            partial(
+                summarize_spark_profile,
+                profile,
+                max_hotspots=self.config.max_hotspots,
+                max_chars=self.config.max_summary_chars,
+                max_threads=self.config.max_threads,
+            ),
+        )
+        self._summary_futures.add(future)
+        future.add_done_callback(self._summary_futures.discard)
+        return await asyncio.shield(future)
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         async with self._http_client_lock:
@@ -1683,13 +1725,7 @@ class SparkAnalyzePlugin(Star):
                     timeout_seconds=self.config.request_timeout_seconds,
                     client=client,
                 )
-                summary = await asyncio.to_thread(
-                    summarize_spark_profile,
-                    profile,
-                    max_hotspots=self.config.max_hotspots,
-                    max_chars=self.config.max_summary_chars,
-                    max_threads=self.config.max_threads,
-                )
+                summary = await self._summarize_profile(profile)
                 sender = _sender_text(event)
                 prompt = build_analysis_prompt(
                     code=link.code,
@@ -1736,6 +1772,8 @@ class SparkAnalyzePlugin(Star):
 
     async def terminate(self) -> None:
         self._terminating = True
+        still_active_tasks: set[asyncio.Task[Any]] = set()
+        pending_summary_futures: set[asyncio.Future[Any]] = set()
         current_task = asyncio.current_task()
         active_tasks = [
             task
@@ -1768,11 +1806,30 @@ class SparkAnalyzePlugin(Star):
                             return_exceptions=True,
                         )
                     if still_pending:
+                        still_active_tasks = set(still_pending)
                         logger.warning(
                             "[SparkAnalyze] 仍有 %s 个分析任务未响应取消",
                             len(still_pending),
                         )
+            summary_futures = list(self._summary_futures)
+            if summary_futures:
+                _, pending_summary_futures = await asyncio.wait(
+                    summary_futures,
+                    timeout=DEFAULT_TERMINATE_WAIT_SECONDS,
+                )
+                if pending_summary_futures:
+                    logger.warning(
+                        "[SparkAnalyze] 终止时仍有 %s 个摘要线程未结束",
+                        len(pending_summary_futures),
+                    )
         finally:
+            executor = self._summary_executor
+            self._summary_executor = None
+            if executor is not None:
+                executor.shutdown(
+                    wait=not pending_summary_futures,
+                    cancel_futures=True,
+                )
             async with self._http_client_lock:
                 client = self._http_client
                 self._http_client = None
@@ -1781,5 +1838,9 @@ class SparkAnalyzePlugin(Star):
 
             async with self._in_flight_lock:
                 self._in_flight_codes.clear()
-            async with self._pending_analysis_lock:
-                self._pending_analysis_count = 0
+            self._termination_incomplete = bool(
+                still_active_tasks or pending_summary_futures
+            )
+            if not self._termination_incomplete:
+                async with self._pending_analysis_lock:
+                    self._pending_analysis_count = 0
