@@ -545,6 +545,22 @@ class HelperTests(unittest.TestCase):
         with self.assertRaises(main.SparkDataTooLarge):
             asyncio.run(main.fetch_spark_json("abc123", client=client, max_bytes=5))
 
+    def test_fetch_spark_json_rejects_too_many_threads(self):
+        profile = sample_profile()
+        profile["threads"] = [
+            {"name": f"Thread {index}", "times": [1]}
+            for index in range(main.MAX_PROFILE_THREADS + 1)
+        ]
+        response = FakeResponse(
+            json.dumps({"type": "sampler", **profile}).encode("utf-8"),
+            main.SPARK_JSON_CONTENT_TYPE,
+        )
+        response.url = types.SimpleNamespace(host="spark-json-service.lucko.me")
+        client = FakeHttpClient(response)
+
+        with self.assertRaises(main.SparkFetchError):
+            asyncio.run(main.fetch_spark_json("abc123", client=client))
+
     def test_fetch_spark_profile_wraps_network_error(self):
         with self.assertRaises(main.SparkFetchError):
             asyncio.run(main.fetch_spark_profile("abc123", client=ErrorHttpClient()))
@@ -799,6 +815,57 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(core_hotspots[0].source, "")
         self.assertFalse(core_hotspots[0].source_inferred)
 
+        ambiguous_thread = {
+            "name": "Render thread",
+            "times": [100],
+            "childrenRefs": [0, 1],
+            "children": [
+                {
+                    "className": "com.alpha.Entry",
+                    "methodName": "render",
+                    "times": [100],
+                    "childrenRefs": [2],
+                },
+                {
+                    "className": "com.beta.Entry",
+                    "methodName": "render",
+                    "times": [100],
+                    "childrenRefs": [2],
+                },
+                {
+                    "className": "org.lwjgl.opengl.GL",
+                    "methodName": "nativeDraw",
+                    "times": [100],
+                    "childrenRefs": [],
+                },
+            ],
+        }
+        ambiguous_hotspots, _ = main._collect_thread_hotspots(
+            ambiguous_thread,
+            {
+                "com.alpha.Entry": "alpha",
+                "com.beta.Entry": "beta",
+            },
+        )
+        self.assertEqual(ambiguous_hotspots[0].source, "")
+        self.assertEqual(ambiguous_hotspots[0].source_candidates, ("alpha", "beta"))
+        self.assertTrue(ambiguous_hotspots[0].source_inferred)
+
+        ambiguous_profile = sample_profile()
+        ambiguous_profile["classSources"] = {
+            "com.alpha.Entry": "alpha",
+            "com.beta.Entry": "beta",
+        }
+        ambiguous_profile["threads"] = [ambiguous_thread]
+        ambiguous_summary = main.summarize_spark_profile(
+            ambiguous_profile,
+            max_hotspots=1,
+            max_threads=1,
+            max_chars=10000,
+        )
+        self.assertIn("多个调用链候选（alpha、beta，归属不确定）", ambiguous_summary)
+        self.assertIn("多 source 调用链归属不确定：100.00%", ambiguous_summary)
+
     def test_summary_reports_inferred_source_and_accounting_coverage(self):
         profile = sample_profile()
         profile["classSources"] = {
@@ -845,6 +912,21 @@ class HelperTests(unittest.TestCase):
         self.assertIn("已展开热点覆盖可解释自耗：100.00%", summary)
         self.assertIn("其中调用链推断占该 source 自耗=100.00%", summary)
 
+    def test_summary_thread_coverage_uses_complete_hotspot_set(self):
+        profile = sample_profile()
+        profile["classSources"] = {}
+        profile["threads"] = [profile_thread("High", 100, [50, 30, 20])]
+
+        summary = main.summarize_spark_profile(
+            profile,
+            max_hotspots=2,
+            max_threads=1,
+            max_chars=10000,
+        )
+
+        self.assertIn("High: 全局线程采样占比=100.00%, 可解释自耗=100.00%", summary)
+        self.assertIn("已展开热点覆盖可解释自耗：80.00%", summary)
+
     def test_summarize_profile_reports_thread_trimming_and_coverage(self):
         profile = sample_profile()
         profile["classSources"] = {}
@@ -890,6 +972,7 @@ class HelperTests(unittest.TestCase):
         self.assertIn("总体结论", prompt)
         self.assertIn("不要编造", prompt)
         self.assertIn("调用链推断", prompt)
+        self.assertIn("归属不确定", prompt)
         self.assertIn("共享调用上下文", prompt)
         self.assertIn("未覆盖部分不能被当作不存在性能开销", prompt)
         self.assertIn("summary text", prompt)

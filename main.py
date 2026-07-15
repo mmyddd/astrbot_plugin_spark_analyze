@@ -43,6 +43,7 @@ MAX_REQUEST_TIMEOUT_SECONDS = 300
 MAX_LLM_TIMEOUT_SECONDS = 600
 MAX_LLM_MAX_TOKENS = 32768
 MAX_PROFILE_TREE_NODES = 250000
+MAX_PROFILE_THREADS = 512
 
 OPENAI_COMPATIBLE_TEMPLATES = frozenset({"openai_compatible", "modelscope"})
 RESPONSES_API_TEMPLATE = "responses_api"
@@ -77,6 +78,7 @@ class Hotspot:
     thread_index: int = -1
     source_inferred: bool = False
     context_count: int = 1
+    source_candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -457,6 +459,11 @@ async def fetch_spark_json(
         raise SparkFetchError("Spark JSON 缺少 metadata")
     if not isinstance(data.get("threads"), list):
         raise SparkFetchError("Spark JSON 缺少完整 threads 数据")
+    if len(data["threads"]) > MAX_PROFILE_THREADS:
+        raise SparkFetchError(
+            "Spark JSON 线程数超过限制："
+            f"{len(data['threads'])} > {MAX_PROFILE_THREADS}"
+        )
     return data
 
 
@@ -579,8 +586,9 @@ def _collect_thread_hotspots(
     # once, keep one representative root-to-node path, and derive self time by
     # subtracting the unique direct children from the inclusive node samples.
     paths: dict[int, list[str]] = {}
-    path_non_core_sources: dict[int, str] = {}
+    path_non_core_sources: dict[int, set[str]] = {}
     path_context_counts: dict[int, int] = {}
+    seen_edges: set[tuple[int, int]] = set()
     queue: list[int] = []
     for root_ref in root_refs:
         if (
@@ -592,9 +600,9 @@ def _collect_thread_hotspots(
             paths[root_ref] = [_node_label(nodes[root_ref])]
             root_source = _node_source(nodes[root_ref], class_sources)
             path_non_core_sources[root_ref] = (
-                root_source
+                {root_source}
                 if root_source and not _is_core_source(root_source)
-                else ""
+                else set()
             )
             path_context_counts[root_ref] = 1
             queue.append(root_ref)
@@ -617,21 +625,32 @@ def _collect_thread_hotspots(
                 or not isinstance(nodes[child_ref], dict)
             ):
                 continue
+            edge_key = (ref, child_ref)
+            is_new_edge = edge_key not in seen_edges
+            seen_edges.add(edge_key)
+            child_source = _node_source(nodes[child_ref], class_sources)
+            incoming_sources = set(path_non_core_sources.get(ref, set()))
+            if child_source and not _is_core_source(child_source):
+                incoming_sources.add(child_source)
             if child_ref in paths:
-                path_context_counts[child_ref] = (
-                    path_context_counts.get(child_ref, 1) + 1
+                if is_new_edge:
+                    path_context_counts[child_ref] = (
+                        path_context_counts.get(child_ref, 1) + 1
+                    )
+                current_sources = path_non_core_sources.setdefault(
+                    child_ref,
+                    set(),
                 )
+                previous_count = len(current_sources)
+                current_sources.update(incoming_sources)
+                if len(current_sources) > previous_count:
+                    queue.append(child_ref)
                 continue
             paths[child_ref] = [
                 *paths[ref][-7:],
                 _node_label(nodes[child_ref]),
             ]
-            child_source = _node_source(nodes[child_ref], class_sources)
-            path_non_core_sources[child_ref] = (
-                child_source
-                if child_source and not _is_core_source(child_source)
-                else path_non_core_sources.get(ref, "")
-            )
+            path_non_core_sources[child_ref] = incoming_sources
             path_context_counts[child_ref] = 1
             queue.append(child_ref)
 
@@ -644,16 +663,23 @@ def _collect_thread_hotspots(
         if score <= 0:
             continue
         direct_source = _node_source(raw_node, class_sources)
-        path_source = path_non_core_sources.get(ref, "")
+        path_sources = tuple(sorted(path_non_core_sources.get(ref, set())))
         if direct_source:
             source = direct_source
             source_inferred = False
-        elif path_source:
-            source = path_source
+            source_candidates = ()
+        elif len(path_sources) == 1:
+            source = path_sources[0]
             source_inferred = True
+            source_candidates = ()
+        elif path_sources:
+            source = ""
+            source_inferred = True
+            source_candidates = path_sources
         else:
-            source = direct_source
+            source = ""
             source_inferred = False
+            source_candidates = ()
         hotspots.append(
             Hotspot(
                 path=" -> ".join(labels[-8:]),
@@ -662,6 +688,7 @@ def _collect_thread_hotspots(
                 source=source,
                 source_inferred=source_inferred,
                 context_count=path_context_counts.get(ref, 1),
+                source_candidates=source_candidates,
             )
         )
 
@@ -675,6 +702,7 @@ def _collect_thread_hotspots(
                 source=item.source,
                 source_inferred=item.source_inferred,
                 context_count=item.context_count,
+                source_candidates=item.source_candidates,
             )
             for item in hotspots
         ]
@@ -734,80 +762,64 @@ def _select_representative_hotspots(
     # thread and maximize the total selected self-sample score. This jointly
     # chooses threads and hotspots, so a high-root-sample thread with weak
     # evidence cannot displace a lower-root-sample thread with a strong hotspot.
-    negative_infinity = float("-inf")
-    states = [
-        [negative_infinity] * (hotspot_limit + 1)
-        for _ in range(thread_limit + 1)
-    ]
-    states[0][0] = 0.0
-    parent_layers: list[
-        list[list[tuple[int, int, int] | None]]
-    ] = []
+    states: dict[tuple[int, int], float] = {(0, 0): 0.0}
+    parent_layers: list[dict[tuple[int, int], int]] = []
 
     for thread in ranked_threads:
         prefix_scores = [0.0]
         for hotspot in thread.hotspots:
             prefix_scores.append(prefix_scores[-1] + hotspot.score)
 
-        next_states = [row[:] for row in states]
-        parents: list[list[tuple[int, int, int] | None]] = [
-            [None] * (hotspot_limit + 1)
-            for _ in range(thread_limit + 1)
-        ]
-        for used_threads in range(thread_limit):
-            for used_hotspots in range(hotspot_limit + 1):
-                current_score = states[used_threads][used_hotspots]
-                if current_score == negative_infinity:
-                    continue
-                max_allocation = min(
-                    len(thread.hotspots),
-                    hotspot_limit - used_hotspots,
+        next_states = dict(states)
+        parents: dict[tuple[int, int], int] = {}
+        for (used_threads, used_hotspots), current_score in states.items():
+            if used_threads >= thread_limit:
+                continue
+            max_allocation = min(
+                len(thread.hotspots),
+                hotspot_limit - used_hotspots,
+            )
+            for allocation in range(1, max_allocation + 1):
+                next_key = (
+                    used_threads + 1,
+                    used_hotspots + allocation,
                 )
-                for allocation in range(1, max_allocation + 1):
-                    next_threads = used_threads + 1
-                    next_hotspots = used_hotspots + allocation
-                    score = current_score + prefix_scores[allocation]
-                    if score > next_states[next_threads][next_hotspots]:
-                        next_states[next_threads][next_hotspots] = score
-                        parents[next_threads][next_hotspots] = (
-                            used_threads,
-                            used_hotspots,
-                            allocation,
-                        )
+                score = current_score + prefix_scores[allocation]
+                if score > next_states.get(next_key, float("-inf")):
+                    next_states[next_key] = score
+                    parents[next_key] = allocation
         states = next_states
         parent_layers.append(parents)
 
     best_threads = 0
     best_hotspots = 0
-    best_score = negative_infinity
-    for used_threads in range(1, thread_limit + 1):
-        for used_hotspots in range(1, hotspot_limit + 1):
-            score = states[used_threads][used_hotspots]
-            if score == negative_infinity:
-                continue
-            if (
-                score > best_score
-                or (
-                    score == best_score
-                    and (used_threads, used_hotspots)
-                    > (best_threads, best_hotspots)
-                )
-            ):
-                best_score = score
-                best_threads = used_threads
-                best_hotspots = used_hotspots
+    best_score = float("-inf")
+    for (used_threads, used_hotspots), score in states.items():
+        if used_threads == 0 or used_hotspots == 0:
+            continue
+        if (
+            score > best_score
+            or (
+                score == best_score
+                and (used_threads, used_hotspots)
+                > (best_threads, best_hotspots)
+            )
+        ):
+            best_score = score
+            best_threads = used_threads
+            best_hotspots = used_hotspots
 
     allocations = [0] * len(ranked_threads)
     used_threads = best_threads
     used_hotspots = best_hotspots
     for index in range(len(ranked_threads) - 1, -1, -1):
-        parent = parent_layers[index][used_threads][used_hotspots]
-        if parent is None:
+        key = (used_threads, used_hotspots)
+        allocation = parent_layers[index].get(key)
+        if allocation is None:
             continue
-        previous_threads, previous_hotspots, allocation = parent
         allocations[index] = allocation
-        used_threads = previous_threads
-        used_hotspots = previous_hotspots
+        used_threads -= 1
+        used_hotspots -= allocation
 
     selected_threads = [
         thread
@@ -952,6 +964,11 @@ def summarize_spark_profile(
     threads = profile.get("threads")
     if not isinstance(threads, list):
         threads = []
+    if len(threads) > MAX_PROFILE_THREADS:
+        raise SparkFetchError(
+            "Spark profile 线程数超过限制："
+            f"{len(threads)} > {MAX_PROFILE_THREADS}"
+        )
     for thread_index, raw_thread in enumerate(threads):
         if not isinstance(raw_thread, dict):
             continue
@@ -975,6 +992,7 @@ def summarize_spark_profile(
                         thread_index=thread_index,
                         source_inferred=item.source_inferred,
                         context_count=item.context_count,
+                        source_candidates=item.source_candidates,
                     )
                     for item in sorted(
                         thread_hotspots,
@@ -1004,6 +1022,7 @@ def summarize_spark_profile(
                 thread_index=item.thread_index,
                 source_inferred=item.source_inferred,
                 context_count=item.context_count,
+                source_candidates=item.source_candidates,
             )
             for item in thread.hotspots
         )
@@ -1031,6 +1050,9 @@ def summarize_spark_profile(
     selected_thread_indices = {
         thread.thread_index for thread in selected_threads
     }
+    full_thread_by_index = {
+        thread.thread_index: thread for thread in normalized_thread_summaries
+    }
     selected_quota: dict[int, int] = {}
     for hotspot in selected_hotspots:
         selected_quota[hotspot.thread_index] = (
@@ -1042,7 +1064,8 @@ def summarize_spark_profile(
             if total_sample_score > 0
             else 0.0
         )
-        thread_self_score = sum(item.score for item in thread.hotspots)
+        full_thread = full_thread_by_index.get(thread.thread_index, thread)
+        thread_self_score = sum(item.score for item in full_thread.hotspots)
         thread_self_coverage = (
             thread_self_score / thread.total * 100
             if thread.total > 0
@@ -1116,6 +1139,11 @@ def summarize_spark_profile(
         if hotspot.source:
             inferred_text = "（调用链推断）" if hotspot.source_inferred else ""
             source_text = f"，source={hotspot.source}{inferred_text}"
+        elif hotspot.source_candidates:
+            candidates = "、".join(hotspot.source_candidates)
+            source_text = (
+                f"，source=多个调用链候选（{candidates}，归属不确定）"
+            )
         context_text = (
             f"，共享调用上下文={hotspot.context_count}"
             if hotspot.context_count > 1
@@ -1133,8 +1161,12 @@ def summarize_spark_profile(
 
     third_party_scores: dict[str, float] = {}
     third_party_inferred_scores: dict[str, float] = {}
+    ambiguous_source_score = 0.0
     for hotspot in all_hotspots:
         source = hotspot.source.strip()
+        if hotspot.source_candidates:
+            ambiguous_source_score += hotspot.score
+            continue
         if source and not _is_core_source(source):
             third_party_scores[source] = (
                 third_party_scores.get(source, 0.0) + hotspot.score
@@ -1164,9 +1196,15 @@ def summarize_spark_profile(
             )
     else:
         lines.append("- 未找到可归属的第三方 source")
+    if ambiguous_source_score > 0:
+        lines.append(
+            f"- 多 source 调用链归属不确定："
+            f"{_format_percent(ambiguous_source_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+            "（未计入单一第三方 source 聚合）"
+        )
     lines.append(
         "- source 归属说明：优先使用热点节点自身的 source；叶节点未标注时，"
-        "沿代表性调用链使用最近的非内置 source，并标记为“调用链推断”。"
+        "沿代表性调用链使用最近的非内置 source；多个候选时标记为归属不确定。"
     )
 
     return _truncate_text("\n".join(lines), max_chars)
@@ -1198,6 +1236,7 @@ Spark code：{code}
     - 区分客户端渲染问题与服务端 tick 问题。
     - 标记为“调用链推断”的 source 只能作为归属线索，不要当作直接证据；
       结合完整调用路径和采样占比判断。
+    - 标记为“归属不确定”的多个 source 候选不能强行归因给任一 Mod。
     - “共享调用上下文”表示同一调用树节点被多个父路径引用，自耗已去重，
       不要将它重复相加。
     - 注意“调用图可解释自耗覆盖”和“已展开热点覆盖”两个指标，
