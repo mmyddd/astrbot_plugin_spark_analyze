@@ -157,7 +157,7 @@
     "description": "摘要中展开的高占用线程数量。",
     "type": "int",
     "default": 8,
-    "hint": "按线程根节点总采样值排序，插件内部上限 64。"
+    "hint": "与热点数量联合优化可解释自耗采样，插件内部上限 64。"
   },
   "request_timeout_seconds": {
     "description": "Spark 原始 profile 和 JSON service 请求超时时间，单位为秒。",

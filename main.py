@@ -579,7 +579,6 @@ def _collect_thread_hotspots(
     # once, keep one representative root-to-node path, and derive self time by
     # subtracting the unique direct children from the inclusive node samples.
     paths: dict[int, list[str]] = {}
-    path_sources: dict[int, str] = {}
     path_non_core_sources: dict[int, str] = {}
     path_context_counts: dict[int, int] = {}
     queue: list[int] = []
@@ -592,7 +591,6 @@ def _collect_thread_hotspots(
         ):
             paths[root_ref] = [_node_label(nodes[root_ref])]
             root_source = _node_source(nodes[root_ref], class_sources)
-            path_sources[root_ref] = root_source
             path_non_core_sources[root_ref] = (
                 root_source
                 if root_source and not _is_core_source(root_source)
@@ -629,7 +627,6 @@ def _collect_thread_hotspots(
                 _node_label(nodes[child_ref]),
             ]
             child_source = _node_source(nodes[child_ref], class_sources)
-            path_sources[child_ref] = child_source or path_sources.get(ref, "")
             path_non_core_sources[child_ref] = (
                 child_source
                 if child_source and not _is_core_source(child_source)
@@ -647,18 +644,23 @@ def _collect_thread_hotspots(
         if score <= 0:
             continue
         direct_source = _node_source(raw_node, class_sources)
-        inferred_source = (
-            path_non_core_sources.get(ref, "")
-            if not direct_source or _is_core_source(direct_source)
-            else ""
-        )
+        path_source = path_non_core_sources.get(ref, "")
+        if direct_source:
+            source = direct_source
+            source_inferred = False
+        elif path_source:
+            source = path_source
+            source_inferred = True
+        else:
+            source = direct_source
+            source_inferred = False
         hotspots.append(
             Hotspot(
                 path=" -> ".join(labels[-8:]),
                 score=score,
                 share=0.0,
-                source=direct_source or inferred_source or path_sources.get(ref, ""),
-                source_inferred=bool(inferred_source),
+                source=source,
+                source_inferred=source_inferred,
                 context_count=path_context_counts.get(ref, 1),
             )
         )
@@ -689,7 +691,25 @@ def _select_representative_hotspots(
 
     ranked_threads = sorted(
         (
-            thread
+            ThreadHotspotSummary(
+                name=thread.name,
+                total=thread.total,
+                hotspots=tuple(
+                    sorted(
+                        (
+                            hotspot
+                            for hotspot in thread.hotspots
+                            if hotspot.score > 0
+                        ),
+                        key=lambda hotspot: (
+                            -hotspot.score,
+                            -hotspot.global_share,
+                            hotspot.path,
+                        ),
+                    )[:max_hotspots]
+                ),
+                thread_index=thread.thread_index,
+            )
             for thread in thread_summaries
             if thread.total > 0 and thread.hotspots
         ),
@@ -699,56 +719,106 @@ def _select_representative_hotspots(
             thread.name,
         ),
     )
-    selected_threads = ranked_threads[: min(max_threads, max_hotspots)]
-    if not selected_threads:
+    if not ranked_threads:
         return [], []
 
-    allocations = [0] * len(selected_threads)
-    selected_hotspots: list[Hotspot] = []
+    thread_limit = min(max_threads, max_hotspots, len(ranked_threads))
+    hotspot_limit = min(
+        max_hotspots,
+        sum(len(thread.hotspots) for thread in ranked_threads),
+    )
+    if thread_limit <= 0 or hotspot_limit <= 0:
+        return [], []
 
-    # Seed each retained thread with one hotspot, then select the largest
-    # remaining self-sample hotspot globally. This is optimal for sample
-    # coverage after the one-hotspot-per-thread representation constraint.
-    for index, thread in enumerate(selected_threads):
-        if len(selected_hotspots) >= max_hotspots:
-            break
-        selected_hotspots.append(thread.hotspots[0])
-        allocations[index] = 1
+    # Multiple-choice knapsack: allocate at least one hotspot to every chosen
+    # thread and maximize the total selected self-sample score. This jointly
+    # chooses threads and hotspots, so a high-root-sample thread with weak
+    # evidence cannot displace a lower-root-sample thread with a strong hotspot.
+    negative_infinity = float("-inf")
+    states = [
+        [negative_infinity] * (hotspot_limit + 1)
+        for _ in range(thread_limit + 1)
+    ]
+    states[0][0] = 0.0
+    parent_layers: list[
+        list[list[tuple[int, int, int] | None]]
+    ] = []
 
-    while len(selected_hotspots) < max_hotspots:
-        best_index: int | None = None
-        best_hotspot: Hotspot | None = None
-        for index, thread in enumerate(selected_threads):
-            if allocations[index] >= len(thread.hotspots):
+    for thread in ranked_threads:
+        prefix_scores = [0.0]
+        for hotspot in thread.hotspots:
+            prefix_scores.append(prefix_scores[-1] + hotspot.score)
+
+        next_states = [row[:] for row in states]
+        parents: list[list[tuple[int, int, int] | None]] = [
+            [None] * (hotspot_limit + 1)
+            for _ in range(thread_limit + 1)
+        ]
+        for used_threads in range(thread_limit):
+            for used_hotspots in range(hotspot_limit + 1):
+                current_score = states[used_threads][used_hotspots]
+                if current_score == negative_infinity:
+                    continue
+                max_allocation = min(
+                    len(thread.hotspots),
+                    hotspot_limit - used_hotspots,
+                )
+                for allocation in range(1, max_allocation + 1):
+                    next_threads = used_threads + 1
+                    next_hotspots = used_hotspots + allocation
+                    score = current_score + prefix_scores[allocation]
+                    if score > next_states[next_threads][next_hotspots]:
+                        next_states[next_threads][next_hotspots] = score
+                        parents[next_threads][next_hotspots] = (
+                            used_threads,
+                            used_hotspots,
+                            allocation,
+                        )
+        states = next_states
+        parent_layers.append(parents)
+
+    best_threads = 0
+    best_hotspots = 0
+    best_score = negative_infinity
+    for used_threads in range(1, thread_limit + 1):
+        for used_hotspots in range(1, hotspot_limit + 1):
+            score = states[used_threads][used_hotspots]
+            if score == negative_infinity:
                 continue
-            candidate = thread.hotspots[allocations[index]]
             if (
-                best_index is None
-                or best_hotspot is None
-                or candidate.score > best_hotspot.score
+                score > best_score
                 or (
-                    candidate.score == best_hotspot.score
-                    and (
-                        thread.name,
-                        thread.thread_index,
-                        candidate.path,
-                    )
-                    < (
-                        selected_threads[best_index].name,
-                        selected_threads[best_index].thread_index,
-                        best_hotspot.path,
-                    )
+                    score == best_score
+                    and (used_threads, used_hotspots)
+                    > (best_threads, best_hotspots)
                 )
             ):
-                best_index = index
-                best_hotspot = candidate
+                best_score = score
+                best_threads = used_threads
+                best_hotspots = used_hotspots
 
-        if best_index is None:
-            break
-        selected_hotspots.append(
-            selected_threads[best_index].hotspots[allocations[best_index]]
-        )
-        allocations[best_index] += 1
+    allocations = [0] * len(ranked_threads)
+    used_threads = best_threads
+    used_hotspots = best_hotspots
+    for index in range(len(ranked_threads) - 1, -1, -1):
+        parent = parent_layers[index][used_threads][used_hotspots]
+        if parent is None:
+            continue
+        previous_threads, previous_hotspots, allocation = parent
+        allocations[index] = allocation
+        used_threads = previous_threads
+        used_hotspots = previous_hotspots
+
+    selected_threads = [
+        thread
+        for thread, allocation in zip(ranked_threads, allocations)
+        if allocation > 0
+    ]
+    selected_hotspots = [
+        hotspot
+        for thread, allocation in zip(ranked_threads, allocations)
+        for hotspot in thread.hotspots[:allocation]
+    ]
 
     selected_hotspots.sort(
         key=lambda hotspot: hotspot.global_share,
@@ -1083,7 +1153,8 @@ def summarize_spark_profile(
         ):
             inferred_score = third_party_inferred_scores.get(source, 0.0)
             inferred_text = (
-                f"，其中调用链推断={_format_percent(inferred_score / total_sample_score * 100)}"
+                f"，其中调用链推断占该 source 自耗="
+                f"{_format_percent(inferred_score / score * 100)}"
                 if inferred_score > 0
                 else ""
             )

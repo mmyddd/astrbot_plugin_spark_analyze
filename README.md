@@ -34,7 +34,7 @@ https://spark.lucko.me/02pGFymGbD
 - `max_json_bytes`：完整 JSON 大小上限，默认 10 MiB。
 - `max_summary_chars`：发送给 LLM 的摘要字符上限，默认 60000。
 - `max_hotspots`：保留的热点数量，默认 20；先保证每个选中线程有代表热点，剩余名额按全局自耗采样值选择。
-- `max_threads`：按线程根节点总采样值选取并展开的高占用线程数量，默认 8；无可用自耗热点的线程不会占用名额。
+- `max_threads`：最多参与摘要的线程数量，默认 8；选择器在该上限和 `max_hotspots` 上限下联合最大化可解释自耗采样，无可用自耗热点的线程不会占用名额。
 - `request_timeout_seconds`：Spark 请求超时，默认 60 秒。
 
 当 `llm_providers` 留空时，插件使用当前会话的 AstrBot Provider。配置多个 Provider 时，插件会按列表顺序尝试，第一个成功的结果会被采用。

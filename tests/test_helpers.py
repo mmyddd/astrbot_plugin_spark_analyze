@@ -659,7 +659,7 @@ class HelperTests(unittest.TestCase):
                 )
                 for name in ("High", "Medium", "Low")
             },
-            {"High": 4, "Medium": 1, "Low": 1},
+            {"High": 3, "Medium": 2, "Low": 1},
         )
 
     def test_select_representative_hotspots_maximizes_remaining_sample_coverage(self):
@@ -709,12 +709,29 @@ class HelperTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual([thread.name for thread in selected_threads], ["High", "Low"])
+        self.assertEqual([thread.name for thread in selected_threads], ["High"])
         self.assertEqual(len(selected_hotspots), 2)
         self.assertEqual(
             {hotspot.thread_name for hotspot in selected_hotspots},
-            {"High", "Low"},
+            {"High"},
         )
+
+    def test_select_representative_hotspots_jointly_optimizes_threads_and_slots(self):
+        summaries = [
+            thread_hotspot_summary(0, "Root-heavy weak", 100, [1]),
+            thread_hotspot_summary(1, "Lower-root strong", 90, [90]),
+        ]
+
+        selected_threads, selected_hotspots = (
+            main._select_representative_hotspots(
+                summaries,
+                max_threads=1,
+                max_hotspots=1,
+            )
+        )
+
+        self.assertEqual([thread.name for thread in selected_threads], ["Lower-root strong"])
+        self.assertEqual([hotspot.score for hotspot in selected_hotspots], [90])
 
     def test_collect_hotspot_infers_source_from_call_path(self):
         thread = {
@@ -755,6 +772,32 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(hotspots), 1)
         self.assertEqual(hotspots[0].source, "testmod")
         self.assertTrue(hotspots[0].source_inferred)
+
+        core_only_thread = {
+            "name": "Render thread",
+            "times": [100],
+            "childrenRefs": [0],
+            "children": [
+                {
+                    "className": "net.minecraft.Render",
+                    "methodName": "draw",
+                    "times": [100],
+                    "childrenRefs": [1],
+                },
+                {
+                    "className": "org.lwjgl.opengl.GL",
+                    "methodName": "nativeDraw",
+                    "times": [100],
+                    "childrenRefs": [],
+                },
+            ],
+        }
+        core_hotspots, _ = main._collect_thread_hotspots(
+            core_only_thread,
+            {"net.minecraft.Render": "minecraft"},
+        )
+        self.assertEqual(core_hotspots[0].source, "")
+        self.assertFalse(core_hotspots[0].source_inferred)
 
     def test_summary_reports_inferred_source_and_accounting_coverage(self):
         profile = sample_profile()
@@ -800,7 +843,7 @@ class HelperTests(unittest.TestCase):
         self.assertIn("source=testmod（调用链推断）", summary)
         self.assertIn("调用图可解释自耗覆盖线程根采样：100.00%", summary)
         self.assertIn("已展开热点覆盖可解释自耗：100.00%", summary)
-        self.assertIn("其中调用链推断=100.00%", summary)
+        self.assertIn("其中调用链推断占该 source 自耗=100.00%", summary)
 
     def test_summarize_profile_reports_thread_trimming_and_coverage(self):
         profile = sample_profile()
