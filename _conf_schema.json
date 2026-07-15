@@ -133,7 +133,7 @@
     "description": "原始 Spark profile 的最大下载字节数。",
     "type": "int",
     "default": 20971520,
-    "hint": "默认 20 MiB，插件内部上限 50 MiB。"
+    "hint": "默认 20 MiB，插件内部上限 100 MiB。"
   },
   "max_json_bytes": {
     "description": "完整 Spark JSON 的最大读取字节数。",

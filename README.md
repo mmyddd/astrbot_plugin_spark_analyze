@@ -30,7 +30,7 @@ https://spark.lucko.me/02pGFymGbD
 - `llm_timeout_seconds`：LLM 请求超时，默认 `120` 秒。
 - `reasoning_effort`：可选的 `reasoning_effort` 参数。
 - `debug_log_llm_response`：是否将 LLM 返回文本写入 debug 日志；常规识别、下载、Provider 尝试和成功日志也使用 debug，Provider 失败和处理异常仍使用 warning/error。
-- `max_profile_bytes`：原始 profile 大小上限，默认 20 MiB。
+- `max_profile_bytes`：原始 profile 大小上限，默认 20 MiB，插件内部上限 100 MiB。
 - `max_json_bytes`：完整 JSON 大小上限，默认 10 MiB；插件内部最多处理 512 个线程。
 - `max_summary_chars`：发送给 LLM 的摘要字符上限，默认 60000。
 - `max_hotspots`：保留的热点数量，默认 20；先保证每个选中线程有代表热点，剩余名额按全局自耗采样值选择。
