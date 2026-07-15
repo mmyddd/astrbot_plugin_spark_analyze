@@ -326,6 +326,31 @@ class FakePostClient:
         return FakePostResponse()
 
 
+class FakeResponsesResource:
+    def __init__(self, owner):
+        self.owner = owner
+
+    async def create(self, **kwargs):
+        self.owner.calls.append(kwargs)
+        return self.owner.response
+
+
+class FakeAsyncOpenAI:
+    instances = []
+    next_response = types.SimpleNamespace(output_text="Responses API 结果")
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.calls = []
+        self.response = self.__class__.next_response
+        self.responses = FakeResponsesResource(self)
+        self.closed = False
+        self.__class__.instances.append(self)
+
+    async def close(self):
+        self.closed = True
+
+
 class HelperTests(unittest.TestCase):
     def test_extract_spark_link_accepts_sample_and_trailing_punctuation(self):
         link = main.extract_spark_profile_link(
@@ -843,6 +868,115 @@ class HelperTests(unittest.TestCase):
 
         self.assertIn("性能分析结果", result)
         self.assertEqual(context.provider_calls, ["umo://group/12345"])
+
+    def test_responses_api_uses_sdk_payload_and_normalizes_base_url(self):
+        original_client = main.AsyncOpenAI
+        FakeAsyncOpenAI.instances.clear()
+        main.AsyncOpenAI = FakeAsyncOpenAI
+        self.addCleanup(lambda: setattr(main, "AsyncOpenAI", original_client))
+
+        result = asyncio.run(
+            main._call_responses_api(
+                "profile prompt",
+                {
+                    "name": "OpenAI Responses",
+                    "api_key": "test-key",
+                    "base_url": "https://example.com/",
+                    "model": "gpt-5",
+                },
+                {
+                    "llm_max_tokens": 2048,
+                    "llm_timeout_seconds": 30,
+                    "reasoning_effort": "high",
+                },
+            )
+        )
+
+        self.assertEqual(result, "Responses API 结果")
+        instance = FakeAsyncOpenAI.instances[0]
+        self.assertEqual(instance.kwargs["api_key"], "test-key")
+        self.assertEqual(instance.kwargs["base_url"], "https://example.com/v1")
+        self.assertEqual(instance.kwargs["timeout"], 30.0)
+        self.assertTrue(instance.closed)
+        self.assertEqual(
+            instance.calls,
+            [
+                {
+                    "model": "gpt-5",
+                    "input": "profile prompt",
+                    "max_output_tokens": 2048,
+                    "reasoning": {"effort": "high"},
+                }
+            ],
+        )
+
+    def test_responses_api_extracts_structured_output_when_output_text_empty(self):
+        original_client = main.AsyncOpenAI
+        FakeAsyncOpenAI.instances.clear()
+        FakeAsyncOpenAI.next_response = types.SimpleNamespace(
+            output_text="",
+            output=[
+                types.SimpleNamespace(
+                    content=[
+                        types.SimpleNamespace(text="structured response"),
+                    ]
+                )
+            ],
+        )
+        main.AsyncOpenAI = FakeAsyncOpenAI
+        self.addCleanup(lambda: setattr(main, "AsyncOpenAI", original_client))
+        self.addCleanup(
+            lambda: setattr(
+                FakeAsyncOpenAI,
+                "next_response",
+                types.SimpleNamespace(output_text="Responses API 结果"),
+            )
+        )
+
+        result = asyncio.run(
+            main._call_responses_api(
+                "prompt",
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.com/v1",
+                },
+                {},
+            )
+        )
+
+        self.assertEqual(result, "structured response")
+
+    def test_generate_analysis_selects_responses_api_provider(self):
+        original_call = main._call_responses_api
+        calls = []
+
+        async def fake_call(prompt, provider, config):
+            calls.append((prompt, provider, config))
+            return "Responses provider result"
+
+        main._call_responses_api = fake_call
+        self.addCleanup(lambda: setattr(main, "_call_responses_api", original_call))
+
+        result = asyncio.run(
+            main.generate_analysis(
+                FakeContext(),
+                FakeEvent([]),
+                "prompt",
+                {
+                    "llm_providers": [
+                        {
+                            "__template_key": "responses_api",
+                            "name": "Responses",
+                        }
+                    ]
+                },
+                types.SimpleNamespace(),
+            )
+        )
+
+        self.assertEqual(result, "Responses provider result")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "prompt")
 
     def test_openai_provider_sends_configured_payload(self):
         client = FakePostClient()

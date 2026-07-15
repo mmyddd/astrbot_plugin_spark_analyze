@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from openai import AsyncOpenAI
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -42,6 +43,7 @@ MAX_LLM_MAX_TOKENS = 32768
 MAX_PROFILE_TREE_NODES = 250000
 
 OPENAI_COMPATIBLE_TEMPLATES = frozenset({"openai_compatible", "modelscope"})
+RESPONSES_API_TEMPLATE = "responses_api"
 
 PARSED_MESSAGE_EMOJI_ID = 289
 PARSED_MESSAGE_EMOJI_TYPE = "1"
@@ -755,6 +757,43 @@ def _extract_provider_text(response_data: object, provider_name: str) -> str:
     return text
 
 
+def _normalize_responses_base_url(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.lower().endswith("/v1"):
+        return normalized
+    return f"{normalized}/v1"
+
+
+def _object_value(value: object, key: str) -> object:
+    if isinstance(value, Mapping):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _extract_responses_text(response: object, provider_name: str) -> str:
+    output_text = _object_value(response, "output_text")
+    text = str(output_text or "").strip()
+    if text:
+        return text
+
+    output = _object_value(response, "output")
+    chunks: list[str] = []
+    if isinstance(output, list):
+        for output_item in output:
+            content = _object_value(output_item, "content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                content_text = _object_value(content_item, "text")
+                if content_text:
+                    chunks.append(str(content_text))
+
+    text = "\n".join(chunks).strip()
+    if not text:
+        raise ValueError(f"{provider_name} 返回内容为空")
+    return text
+
+
 async def _call_openai_compatible(
     client: httpx.AsyncClient,
     prompt: str,
@@ -800,6 +839,54 @@ async def _call_openai_compatible(
     response_data = response.json()
     text = _extract_provider_text(response_data, provider_name)
     return text
+
+
+async def _call_responses_api(
+    prompt: str,
+    provider: Mapping[str, Any],
+    config: object,
+) -> str:
+    provider_name = str(provider.get("name") or "Responses API Provider")
+    api_key = str(provider.get("api_key") or "").strip()
+    configured_base_url = str(provider.get("base_url") or "").strip()
+    model = str(provider.get("model") or "").strip() or "gpt-4o"
+    if not api_key or not configured_base_url:
+        raise ValueError(f"{provider_name} 缺少 api_key 或 base_url")
+
+    timeout_seconds = _bounded_config_float(
+        config,
+        "llm_timeout_seconds",
+        DEFAULT_LLM_TIMEOUT_SECONDS,
+        1,
+        MAX_LLM_TIMEOUT_SECONDS,
+    )
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "input": prompt,
+        "max_output_tokens": _bounded_config_int(
+            config,
+            "llm_max_tokens",
+            DEFAULT_LLM_MAX_TOKENS,
+            256,
+            MAX_LLM_MAX_TOKENS,
+        ),
+    }
+    reasoning_effort = str(_config_get(config, "reasoning_effort", "") or "").strip()
+    if reasoning_effort:
+        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+    sdk_client: AsyncOpenAI | None = None
+    try:
+        sdk_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=_normalize_responses_base_url(configured_base_url),
+            timeout=timeout_seconds,
+        )
+        response = await sdk_client.responses.create(**request_kwargs)
+        return _extract_responses_text(response, provider_name)
+    finally:
+        if sdk_client is not None:
+            await sdk_client.close()
 
 
 async def _call_astrbot_provider(
@@ -854,6 +941,8 @@ async def generate_analysis(
             )
             if template == "astrbot_provider":
                 text = await _call_astrbot_provider(context, event, prompt)
+            elif template == RESPONSES_API_TEMPLATE:
+                text = await _call_responses_api(prompt, provider, config)
             elif template in OPENAI_COMPATIBLE_TEMPLATES:
                 text = await _call_openai_compatible(
                     client,

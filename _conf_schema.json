@@ -51,6 +51,34 @@
           }
         }
       },
+      "responses_api": {
+        "name": "OpenAI Responses API",
+        "description": "使用官方 openai-python SDK 调用 Responses API。",
+        "items": {
+          "name": {
+            "description": "供应商别名，仅用于日志标识。",
+            "type": "string",
+            "default": "Responses API"
+          },
+          "api_key": {
+            "description": "API Key。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "Responses API 的 API 地址。",
+            "type": "string",
+            "default": "https://api.openai.com/v1",
+            "hint": "可填写 https://api.openai.com 或带 /v1 的地址。"
+          },
+          "model": {
+            "description": "模型名，留空使用 gpt-4o。",
+            "type": "string",
+            "default": "",
+            "hint": "例如：gpt-4o、gpt-5、o3"
+          }
+        }
+      },
       "modelscope": {
         "name": "ModelScope",
         "description": "ModelScope 推理 API，使用 OpenAI 兼容协议。",

@@ -25,6 +25,7 @@ https://spark.lucko.me/02pGFymGbD
   - `openai_compatible`
   - `astrbot_provider`
   - `modelscope`
+  - `responses_api`：使用官方 `openai-python` SDK 的 Responses API。
 - `llm_max_tokens`：LLM 输出 token 上限，默认 `4096`。
 - `llm_timeout_seconds`：LLM 请求超时，默认 `120` 秒。
 - `reasoning_effort`：可选的 `reasoning_effort` 参数。
@@ -58,6 +59,10 @@ python -m unittest discover -s tests -v
 ```bash
 pip install -r requirements.txt
 ```
+
+`responses_api` 的 `base_url` 可填写 `https://api.openai.com` 或带 `/v1`
+的地址；插件会按 SDK 要求规范化，并将 `reasoning_effort` 映射为
+Responses API 的 `reasoning.effort`。
 
 ## 许可证
 

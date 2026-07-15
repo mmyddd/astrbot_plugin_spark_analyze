@@ -1,7 +1,7 @@
 name: astrbot_plugin_spark_analyze
 display_name: Spark 性能分析
 desc: 自动识别 Spark profile 链接，提取 Minecraft 性能热点并交给 LLM 分析。
-version: v0.1.0
+version: v0.2.0
 author: mmyddd
 repo: https://github.com/mmyddd/astrbot_plugin_spark_analyze
 astrbot_version: ">=4.16"
