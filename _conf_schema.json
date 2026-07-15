@@ -1,0 +1,134 @@
+{
+  "enabled_group_ids": {
+    "description": "启用 Spark profile 自动分析的群号列表。留空表示不处理任何群聊。",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "llm_providers": {
+    "description": "LLM 供应商列表，按顺序依次尝试，第一个成功的 Provider 返回结果。",
+    "type": "template_list",
+    "default": [],
+    "templates": {
+      "openai_compatible": {
+        "name": "OpenAI 兼容",
+        "description": "适用于 GPT、DeepSeek、GLM、通义千问等 OpenAI 格式兼容接口。",
+        "items": {
+          "name": {
+            "description": "供应商别名，仅用于日志标识。",
+            "type": "string",
+            "default": "OpenAI API"
+          },
+          "api_key": {
+            "description": "API Key。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "API 地址。",
+            "type": "string",
+            "default": "",
+            "hint": "例如：https://api.deepseek.com"
+          },
+          "model": {
+            "description": "模型名，留空使用 gpt-4o。",
+            "type": "string",
+            "default": "",
+            "hint": "例如：gpt-4o、deepseek-chat、glm-4-plus"
+          }
+        }
+      },
+      "astrbot_provider": {
+        "name": "AstrBot 当前 Provider",
+        "description": "复用当前会话配置的 AstrBot LLM Provider，不需要额外填写密钥。",
+        "items": {
+          "name": {
+            "description": "供应商别名，仅用于日志标识。",
+            "type": "string",
+            "default": "AstrBot Provider"
+          }
+        }
+      },
+      "modelscope": {
+        "name": "ModelScope",
+        "description": "ModelScope 推理 API，使用 OpenAI 兼容协议。",
+        "items": {
+          "name": {
+            "description": "供应商别名，仅用于日志标识。",
+            "type": "string",
+            "default": "ModelScope"
+          },
+          "api_key": {
+            "description": "ModelScope API Token。",
+            "type": "string",
+            "default": ""
+          },
+          "base_url": {
+            "description": "API 地址。",
+            "type": "string",
+            "default": "https://api-inference.modelscope.cn",
+            "hint": "插件会请求 /v1/chat/completions"
+          },
+          "model": {
+            "description": "模型名，留空使用 gpt-4o。",
+            "type": "string",
+            "default": "",
+            "hint": "例如：Qwen/Qwen2.5-72B-Instruct、deepseek-ai/DeepSeek-V3"
+          }
+        }
+      }
+    }
+  },
+  "llm_max_tokens": {
+    "description": "LLM 单次分析输出的最大 token 数。",
+    "type": "int",
+    "default": 4096
+  },
+  "llm_timeout_seconds": {
+    "description": "LLM 请求超时时间，单位为秒。",
+    "type": "float",
+    "default": 120.0
+  },
+  "reasoning_effort": {
+    "description": "可选的 reasoning_effort 参数，例如 low、medium、high；留空不发送。",
+    "type": "string",
+    "default": ""
+  },
+  "debug_log_llm_response": {
+    "description": "是否将 LLM 返回文本写入日志。可能增加日志量，默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "max_profile_bytes": {
+    "description": "原始 Spark profile 的最大下载字节数。",
+    "type": "int",
+    "default": 20971520,
+    "hint": "默认 20 MiB，插件内部上限 50 MiB。"
+  },
+  "max_json_bytes": {
+    "description": "完整 Spark JSON 的最大读取字节数。",
+    "type": "int",
+    "default": 10485760,
+    "hint": "默认 10 MiB，插件内部上限 50 MiB。"
+  },
+  "max_summary_chars": {
+    "description": "送入 LLM 的 Spark 摘要最大字符数。",
+    "type": "int",
+    "default": 60000,
+    "hint": "用于控制 LLM 上下文长度，插件内部上限 200000。"
+  },
+  "max_hotspots": {
+    "description": "摘要中保留的采样热点和第三方 source 热点数量。",
+    "type": "int",
+    "default": 20,
+    "hint": "插件内部上限 100。"
+  },
+  "request_timeout_seconds": {
+    "description": "Spark 原始 profile 和 JSON service 请求超时时间，单位为秒。",
+    "type": "float",
+    "default": 60.0,
+    "hint": "插件内部上限 300 秒。"
+  }
+}
