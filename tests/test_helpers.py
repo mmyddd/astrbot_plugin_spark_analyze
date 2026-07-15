@@ -504,6 +504,14 @@ class HelperTests(unittest.TestCase):
         )
         self.assertEqual(capped_config.max_profile_bytes, main.MAX_PROFILE_BYTES)
 
+        summary_capped_config = main.SparkAnalyzeConfig.from_object(
+            {"max_summary_chars": main.MAX_SUMMARY_CHARS + 1}
+        )
+        self.assertEqual(
+            summary_capped_config.max_summary_chars,
+            main.MAX_SUMMARY_CHARS,
+        )
+
     def test_fetch_spark_profile_validates_content_type_and_reads_bytes(self):
         client = FakeHttpClient(
             FakeResponse(b"profile", main.SPARK_PROFILE_CONTENT_TYPE)

@@ -144,8 +144,8 @@
   "max_summary_chars": {
     "description": "送入 LLM 的 Spark 摘要最大字符数。",
     "type": "int",
-    "default": 60000,
-    "hint": "用于控制 LLM 上下文长度，插件内部上限 200000。"
+    "default": 5120000,
+    "hint": "默认 5120000 字符，插件内部上限 5120000。"
   },
   "max_hotspots": {
     "description": "摘要中保留的采样热点和第三方 source 热点数量。",
