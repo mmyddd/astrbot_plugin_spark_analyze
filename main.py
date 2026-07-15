@@ -794,6 +794,34 @@ def _extract_responses_text(response: object, provider_name: str) -> str:
     return text
 
 
+async def _collect_responses_stream(stream: object, provider_name: str) -> str:
+    chunks: list[str] = []
+    completed_response: object = None
+    try:
+        async for event in stream:
+            event_type = _object_value(event, "type")
+            if event_type == "response.output_text.delta":
+                delta = _object_value(event, "delta")
+                if delta:
+                    chunks.append(str(delta))
+            elif event_type == "response.completed":
+                completed_response = _object_value(event, "response")
+            elif event_type == "error":
+                message = _object_value(event, "message") or "流式响应失败"
+                raise ValueError(f"{provider_name}：{message}")
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            await close()
+
+    text = "".join(chunks).strip()
+    if text:
+        return text
+    if completed_response is not None:
+        return _extract_responses_text(completed_response, provider_name)
+    raise ValueError(f"{provider_name} 返回内容为空")
+
+
 async def _call_openai_compatible(
     client: httpx.AsyncClient,
     prompt: str,
@@ -870,6 +898,7 @@ async def _call_responses_api(
             256,
             MAX_LLM_MAX_TOKENS,
         ),
+        "stream": True,
     }
     reasoning_effort = str(_config_get(config, "reasoning_effort", "") or "").strip()
     if reasoning_effort:
@@ -885,8 +914,8 @@ async def _call_responses_api(
             # the request. Do not let the SDK retry and consume tokens again.
             max_retries=0,
         )
-        response = await sdk_client.responses.create(**request_kwargs)
-        return _extract_responses_text(response, provider_name)
+        stream = await sdk_client.responses.create(**request_kwargs)
+        return await _collect_responses_stream(stream, provider_name)
     finally:
         if sdk_client is not None:
             await sdk_client.close()

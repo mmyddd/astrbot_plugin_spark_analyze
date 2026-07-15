@@ -332,17 +332,46 @@ class FakeResponsesResource:
 
     async def create(self, **kwargs):
         self.owner.calls.append(kwargs)
+        if kwargs.get("stream"):
+            return self.owner.stream
         return self.owner.response
+
+
+class FakeResponseStream:
+    def __init__(self, events):
+        self.events = events
+        self.closed = False
+
+    def __aiter__(self):
+        async def iterate():
+            for event in self.events:
+                yield event
+
+        return iterate()
+
+    async def close(self):
+        self.closed = True
 
 
 class FakeAsyncOpenAI:
     instances = []
     next_response = types.SimpleNamespace(output_text="Responses API 结果")
+    next_stream_events = [
+        types.SimpleNamespace(
+            type="response.output_text.delta",
+            delta="Responses API 结果",
+        ),
+        types.SimpleNamespace(
+            type="response.completed",
+            response=types.SimpleNamespace(output_text="Responses API 结果"),
+        ),
+    ]
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.calls = []
         self.response = self.__class__.next_response
+        self.stream = FakeResponseStream(self.__class__.next_stream_events)
         self.responses = FakeResponsesResource(self)
         self.closed = False
         self.__class__.instances.append(self)
@@ -899,6 +928,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(instance.kwargs["timeout"], 30.0)
         self.assertEqual(instance.kwargs["max_retries"], 0)
         self.assertTrue(instance.closed)
+        self.assertTrue(instance.stream.closed)
         self.assertEqual(
             instance.calls,
             [
@@ -907,6 +937,7 @@ class HelperTests(unittest.TestCase):
                     "input": "profile prompt",
                     "max_output_tokens": 2048,
                     "reasoning": {"effort": "high"},
+                    "stream": True,
                 }
             ],
         )
@@ -914,16 +945,21 @@ class HelperTests(unittest.TestCase):
     def test_responses_api_extracts_structured_output_when_output_text_empty(self):
         original_client = main.AsyncOpenAI
         FakeAsyncOpenAI.instances.clear()
-        FakeAsyncOpenAI.next_response = types.SimpleNamespace(
-            output_text="",
-            output=[
-                types.SimpleNamespace(
-                    content=[
-                        types.SimpleNamespace(text="structured response"),
-                    ]
-                )
-            ],
-        )
+        FakeAsyncOpenAI.next_stream_events = [
+            types.SimpleNamespace(
+                type="response.completed",
+                response=types.SimpleNamespace(
+                    output_text="",
+                    output=[
+                        types.SimpleNamespace(
+                            content=[
+                                types.SimpleNamespace(text="structured response"),
+                            ]
+                        )
+                    ],
+                ),
+            )
+        ]
         main.AsyncOpenAI = FakeAsyncOpenAI
         self.addCleanup(lambda: setattr(main, "AsyncOpenAI", original_client))
         self.addCleanup(
@@ -931,6 +967,24 @@ class HelperTests(unittest.TestCase):
                 FakeAsyncOpenAI,
                 "next_response",
                 types.SimpleNamespace(output_text="Responses API 结果"),
+            )
+        )
+        self.addCleanup(
+            lambda: setattr(
+                FakeAsyncOpenAI,
+                "next_stream_events",
+                [
+                    types.SimpleNamespace(
+                        type="response.output_text.delta",
+                        delta="Responses API 结果",
+                    ),
+                    types.SimpleNamespace(
+                        type="response.completed",
+                        response=types.SimpleNamespace(
+                            output_text="Responses API 结果"
+                        ),
+                    ),
+                ],
             )
         )
 

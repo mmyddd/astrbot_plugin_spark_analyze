@@ -62,8 +62,8 @@ pip install -r requirements.txt
 
 `responses_api` 的 `base_url` 可填写 `https://api.openai.com` 或带 `/v1`
 的地址；插件会按 SDK 要求规范化，并将 `reasoning_effort` 映射为
-Responses API 的 `reasoning.effort`。为避免上游已扣费但响应断开时重复消费，
-插件关闭了 `openai-python` 的自动重试。
+Responses API 的 `reasoning.effort`。插件默认使用流式响应以降低长请求的网关
+超时风险，并关闭了 `openai-python` 的自动重试，避免上游已扣费但响应断开时重复消费。
 
 ## 许可证
 
