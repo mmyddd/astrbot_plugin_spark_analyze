@@ -153,6 +153,12 @@
     "default": 20,
     "hint": "插件内部上限 100。"
   },
+  "max_threads": {
+    "description": "摘要中展开的高占用线程数量。",
+    "type": "int",
+    "default": 8,
+    "hint": "按全局采样占比排序，插件内部上限 64。"
+  },
   "request_timeout_seconds": {
     "description": "Spark 原始 profile 和 JSON service 请求超时时间，单位为秒。",
     "type": "float",

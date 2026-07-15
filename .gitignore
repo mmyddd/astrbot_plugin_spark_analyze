@@ -10,6 +10,7 @@ env/
 .ruff_cache/
 .coverage
 htmlcov/
+.codegraph/
 
 data/
 downloads/

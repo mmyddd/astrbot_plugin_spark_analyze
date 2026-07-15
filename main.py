@@ -29,6 +29,7 @@ DEFAULT_MAX_PROFILE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_JSON_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_SUMMARY_CHARS = 60000
 DEFAULT_MAX_HOTSPOTS = 20
+DEFAULT_MAX_THREADS = 8
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_MAX_TOKENS = 4096
@@ -37,6 +38,7 @@ MAX_PROFILE_BYTES = 50 * 1024 * 1024
 MAX_JSON_BYTES = 50 * 1024 * 1024
 MAX_SUMMARY_CHARS = 200000
 MAX_HOTSPOTS = 100
+MAX_THREADS = 64
 MAX_REQUEST_TIMEOUT_SECONDS = 300
 MAX_LLM_TIMEOUT_SECONDS = 600
 MAX_LLM_MAX_TOKENS = 32768
@@ -69,6 +71,17 @@ class Hotspot:
     score: float
     share: float
     source: str
+    global_share: float = 0.0
+    thread_name: str = ""
+    thread_index: int = -1
+
+
+@dataclass(frozen=True)
+class ThreadHotspotSummary:
+    name: str
+    total: float
+    hotspots: tuple[Hotspot, ...]
+    thread_index: int = -1
 
 
 def extract_spark_profile_link(text: object) -> SparkProfileLink | None:
@@ -507,6 +520,81 @@ def _collect_thread_hotspots(
     return hotspots, thread_total
 
 
+def _select_representative_hotspots(
+    thread_summaries: list[ThreadHotspotSummary],
+    max_threads: int,
+    max_hotspots: int,
+) -> tuple[list[ThreadHotspotSummary], list[Hotspot]]:
+    if max_threads <= 0 or max_hotspots <= 0:
+        return [], []
+
+    ranked_threads = sorted(
+        (
+            thread
+            for thread in thread_summaries
+            if thread.total > 0 and thread.hotspots
+        ),
+        key=lambda thread: (
+            -thread.total,
+            thread.thread_index if thread.thread_index >= 0 else 0,
+            thread.name,
+        ),
+    )
+    selected_threads = ranked_threads[: min(max_threads, max_hotspots)]
+    if not selected_threads:
+        return [], []
+
+    allocations = [0] * len(selected_threads)
+    selected_hotspots: list[Hotspot] = []
+
+    # Seed each retained thread with one hotspot, then use a weighted
+    # largest-quotient allocation so dominant threads receive more slots while
+    # smaller but meaningful threads remain represented.
+    for index, thread in enumerate(selected_threads):
+        if len(selected_hotspots) >= max_hotspots:
+            break
+        selected_hotspots.append(thread.hotspots[0])
+        allocations[index] = 1
+
+    while len(selected_hotspots) < max_hotspots:
+        best_index: int | None = None
+        best_priority = -1.0
+        for index, thread in enumerate(selected_threads):
+            if allocations[index] >= len(thread.hotspots):
+                continue
+            priority = thread.total / (allocations[index] + 1)
+            if (
+                best_index is None
+                or priority > best_priority
+                or (
+                    priority == best_priority
+                    and (
+                        thread.name,
+                        thread.thread_index,
+                    )
+                    < (
+                        selected_threads[best_index].name,
+                        selected_threads[best_index].thread_index,
+                    )
+                )
+            ):
+                best_index = index
+                best_priority = priority
+
+        if best_index is None:
+            break
+        selected_hotspots.append(
+            selected_threads[best_index].hotspots[allocations[best_index]]
+        )
+        allocations[best_index] += 1
+
+    selected_hotspots.sort(
+        key=lambda hotspot: hotspot.global_share,
+        reverse=True,
+    )
+    return selected_threads, selected_hotspots
+
+
 def _truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
@@ -518,6 +606,7 @@ def summarize_spark_profile(
     profile: Mapping[str, Any],
     max_hotspots: int = DEFAULT_MAX_HOTSPOTS,
     max_chars: int = DEFAULT_MAX_SUMMARY_CHARS,
+    max_threads: int = DEFAULT_MAX_THREADS,
 ) -> str:
     metadata = profile.get("metadata")
     if not isinstance(metadata, dict):
@@ -626,12 +715,12 @@ def summarize_spark_profile(
     if not isinstance(class_sources, dict):
         class_sources = {}
 
-    all_hotspots: list[Hotspot] = []
+    thread_summaries: list[ThreadHotspotSummary] = []
     total_sample_score = 0.0
     threads = profile.get("threads")
     if not isinstance(threads, list):
         threads = []
-    for raw_thread in threads:
+    for thread_index, raw_thread in enumerate(threads):
         if not isinstance(raw_thread, dict):
             continue
         thread_hotspots, thread_total = _collect_thread_hotspots(
@@ -640,28 +729,115 @@ def summarize_spark_profile(
         )
         total_sample_score += thread_total
         thread_name = str(raw_thread.get("name") or "unknown thread")
-        all_hotspots.extend(
+        thread_summaries.append(
+            ThreadHotspotSummary(
+                name=thread_name,
+                total=thread_total,
+                hotspots=tuple(
+                    Hotspot(
+                        path=item.path,
+                        score=item.score,
+                        share=item.share,
+                        source=item.source,
+                        thread_name=thread_name,
+                        thread_index=thread_index,
+                    )
+                    for item in sorted(
+                        thread_hotspots,
+                        key=lambda item: item.score,
+                        reverse=True,
+                    )
+                ),
+                thread_index=thread_index,
+            )
+        )
+
+    all_hotspots: list[Hotspot] = []
+    normalized_thread_summaries: list[ThreadHotspotSummary] = []
+    for thread in thread_summaries:
+        normalized_hotspots = tuple(
             Hotspot(
-                path=f"[{thread_name}] {item.path}",
+                path=item.path,
                 score=item.score,
                 share=item.share,
                 source=item.source,
+                global_share=(
+                    item.score / total_sample_score * 100
+                    if total_sample_score > 0
+                    else 0.0
+                ),
+                thread_name=item.thread_name,
+                thread_index=item.thread_index,
             )
-            for item in thread_hotspots
+            for item in thread.hotspots
         )
+        normalized_thread_summaries.append(
+            ThreadHotspotSummary(
+                name=thread.name,
+                total=thread.total,
+                hotspots=normalized_hotspots,
+                thread_index=thread.thread_index,
+            )
+        )
+        all_hotspots.extend(normalized_hotspots)
 
-    all_hotspots.sort(key=lambda item: item.score, reverse=True)
-    lines.append(
-        "采样自耗热点（每个调用树节点只计一次自耗时，"
-        f"全线程累计采样值={_format_number(total_sample_score)}）："
+    selected_threads, selected_hotspots = _select_representative_hotspots(
+        normalized_thread_summaries,
+        max_threads=max_threads,
+        max_hotspots=max_hotspots,
     )
-    for index, hotspot in enumerate(all_hotspots[:max_hotspots], start=1):
+    selected_score = sum(item.score for item in selected_hotspots)
+
+    lines.append(
+        "线程贡献与裁剪（按全局采样占比排序）："
+    )
+    selected_thread_indices = {
+        thread.thread_index for thread in selected_threads
+    }
+    selected_quota: dict[int, int] = {}
+    for hotspot in selected_hotspots:
+        selected_quota[hotspot.thread_index] = (
+            selected_quota.get(hotspot.thread_index, 0) + 1
+        )
+    for thread in selected_threads:
+        contribution = (
+            thread.total / total_sample_score * 100
+            if total_sample_score > 0
+            else 0.0
+        )
+        lines.append(
+            f"- {thread.name}: 全局线程采样占比={_format_percent(contribution)}, "
+            f"热点配额={selected_quota.get(thread.thread_index, 0)}"
+        )
+    omitted_threads = [
+        thread
+        for thread in normalized_thread_summaries
+        if thread.thread_index not in selected_thread_indices
+    ]
+    if omitted_threads:
+        omitted_score = sum(thread.total for thread in omitted_threads)
+        lines.append(
+            f"- 其余 {len(omitted_threads)} 个线程未展开："
+            f"合计占全局采样 {_format_percent(omitted_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+        )
+    lines.append(
+        f"- 已展开热点覆盖全线程自耗采样："
+        f"{_format_percent(selected_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+    )
+    lines.append("")
+
+    lines.append(
+        "代表性采样自耗热点（按全局采样占比排序；每个调用树节点只计一次）："
+    )
+    for index, hotspot in enumerate(selected_hotspots, start=1):
         source_text = f"，source={hotspot.source}" if hotspot.source else ""
         lines.append(
-            f"{index}. {_format_percent(hotspot.share)} "
-            f"({_format_number(hotspot.score)}): {hotspot.path}{source_text}"
+            f"{index}. 全局={_format_percent(hotspot.global_share)}，"
+            f"线程内={_format_percent(hotspot.share)} "
+            f"({_format_number(hotspot.score)}): "
+            f"[{hotspot.thread_name}] {hotspot.path}{source_text}"
         )
-    if not all_hotspots:
+    if not selected_hotspots:
         lines.append("- 未找到可展开的线程采样树")
     lines.append("")
 
@@ -1131,6 +1307,13 @@ class SparkAnalyzePlugin(Star):
                     1,
                     MAX_HOTSPOTS,
                 )
+                max_threads = _bounded_config_int(
+                    self.config,
+                    "max_threads",
+                    DEFAULT_MAX_THREADS,
+                    1,
+                    MAX_THREADS,
+                )
                 request_timeout_seconds = _bounded_config_float(
                     self.config,
                     "request_timeout_seconds",
@@ -1163,6 +1346,7 @@ class SparkAnalyzePlugin(Star):
                     profile,
                     max_hotspots=max_hotspots,
                     max_chars=max_summary_chars,
+                    max_threads=max_threads,
                 )
                 sender = _sender_text(event)
                 prompt = build_analysis_prompt(

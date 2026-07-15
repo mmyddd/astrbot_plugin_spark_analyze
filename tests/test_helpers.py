@@ -262,6 +262,46 @@ def sample_profile():
     }
 
 
+def thread_hotspot_summary(index, name, total, scores):
+    hotspots = tuple(
+        main.Hotspot(
+            path=f"{name}.hotspot{hotspot_index}",
+            score=score,
+            share=score / total * 100 if total else 0.0,
+            source="",
+            global_share=score,
+            thread_name=name,
+            thread_index=index,
+        )
+        for hotspot_index, score in enumerate(scores, start=1)
+    )
+    return main.ThreadHotspotSummary(
+        name=name,
+        total=total,
+        hotspots=hotspots,
+        thread_index=index,
+    )
+
+
+def profile_thread(name, total, scores):
+    children = [
+        {
+            "className": f"com.example.{name.replace(' ', '')}{index}",
+            "methodName": "hotspot",
+            "lineNumber": index,
+            "times": [score],
+            "childrenRefs": [],
+        }
+        for index, score in enumerate(scores, start=1)
+    ]
+    return {
+        "name": name,
+        "times": [total],
+        "childrenRefs": list(range(len(children))),
+        "children": children,
+    }
+
+
 class FakeResponse:
     def __init__(self, body, content_type):
         self.body = body
@@ -553,6 +593,90 @@ class HelperTests(unittest.TestCase):
 
         self.assertEqual(summary.count("mod.Leaf.leaf"), 1)
         self.assertIn("sharedmod: 100.00%", summary)
+
+    def test_select_representative_hotspots_weights_slots_by_thread_samples(self):
+        summaries = [
+            thread_hotspot_summary(0, "High", 100, [50, 30, 20, 10]),
+            thread_hotspot_summary(1, "Medium", 40, [20, 10, 5]),
+            thread_hotspot_summary(2, "Low", 20, [10, 5]),
+        ]
+
+        selected_threads, selected_hotspots = (
+            main._select_representative_hotspots(
+                summaries,
+                max_threads=3,
+                max_hotspots=6,
+            )
+        )
+
+        self.assertEqual(
+            [thread.name for thread in selected_threads],
+            ["High", "Medium", "Low"],
+        )
+        self.assertEqual(
+            {
+                name: sum(
+                    hotspot.thread_name == name for hotspot in selected_hotspots
+                )
+                for name in ("High", "Medium", "Low")
+            },
+            {"High": 4, "Medium": 1, "Low": 1},
+        )
+
+    def test_select_representative_hotspots_limits_threads_and_skips_empty_threads(
+        self,
+    ):
+        summaries = [
+            thread_hotspot_summary(0, "No hotspot", 100, []),
+            thread_hotspot_summary(1, "High", 80, [50, 30]),
+            thread_hotspot_summary(2, "Low", 10, [10]),
+        ]
+
+        selected_threads, selected_hotspots = (
+            main._select_representative_hotspots(
+                summaries,
+                max_threads=8,
+                max_hotspots=2,
+            )
+        )
+
+        self.assertEqual([thread.name for thread in selected_threads], ["High", "Low"])
+        self.assertEqual(len(selected_hotspots), 2)
+        self.assertEqual(
+            {hotspot.thread_name for hotspot in selected_hotspots},
+            {"High", "Low"},
+        )
+
+    def test_summarize_profile_reports_thread_trimming_and_coverage(self):
+        profile = sample_profile()
+        profile["classSources"] = {}
+        profile["threads"] = [
+            profile_thread("High", 100, [50, 30, 20]),
+            profile_thread("Medium", 40, [30, 10]),
+            profile_thread("Low", 10, [10]),
+        ]
+
+        summary = main.summarize_spark_profile(
+            profile,
+            max_hotspots=4,
+            max_threads=2,
+            max_chars=10000,
+        )
+
+        self.assertIn(
+            "High: 全局线程采样占比=66.67%, 热点配额=3",
+            summary,
+        )
+        self.assertIn(
+            "Medium: 全局线程采样占比=26.67%, 热点配额=1",
+            summary,
+        )
+        self.assertIn(
+            "其余 1 个线程未展开：合计占全局采样 6.67%",
+            summary,
+        )
+        self.assertIn("已展开热点覆盖全线程自耗采样：86.67%", summary)
+        self.assertNotIn("[Low]", summary)
 
     def test_analysis_prompt_requires_evidence_and_limits_hallucination(self):
         prompt = main.build_analysis_prompt(
