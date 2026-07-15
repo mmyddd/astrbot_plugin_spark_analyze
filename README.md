@@ -12,7 +12,7 @@ https://spark.lucko.me/02pGFymGbD
 
 1. 从 Spark bytebin 下载并校验原始 `sparkprofile`。
 2. 从官方 JSON service 获取完整采样数据。
-3. 提取平台信息、TPS/MSPT、内存、Mod/source、线程自耗热点和调用路径；调用树中的共享节点只统计一次，避免祖先/子节点重复计数。
+3. 提取平台信息、TPS/MSPT、内存、Mod/source、线程自耗热点和调用路径；调用树中的共享节点只统计一次，避免祖先/子节点重复计数，并记录可解释采样覆盖率、共享调用上下文和调用链推断的 source。
 4. 使用配置的 LLM Provider 生成中文性能诊断。
 5. 通过合并转发回复来源群。
 
@@ -29,12 +29,12 @@ https://spark.lucko.me/02pGFymGbD
 - `llm_max_tokens`：LLM 输出 token 上限，默认 `4096`。
 - `llm_timeout_seconds`：LLM 请求超时，默认 `120` 秒。
 - `reasoning_effort`：可选的 `reasoning_effort` 参数。
-- `debug_log_llm_response`：是否记录 LLM 返回文本。
+- `debug_log_llm_response`：是否将 LLM 返回文本写入 debug 日志；常规识别、下载、Provider 尝试和成功日志也使用 debug，Provider 失败和处理异常仍使用 warning/error。
 - `max_profile_bytes`：原始 profile 大小上限，默认 20 MiB。
 - `max_json_bytes`：完整 JSON 大小上限，默认 10 MiB。
 - `max_summary_chars`：发送给 LLM 的摘要字符上限，默认 60000。
-- `max_hotspots`：保留的热点数量，默认 20。
-- `max_threads`：按线程根节点总采样值选取并展开的高占用线程数量，默认 8；无可用自耗热点的线程不会占用名额，热点名额按线程采样占比加权分配。
+- `max_hotspots`：保留的热点数量，默认 20；先保证每个选中线程有代表热点，剩余名额按全局自耗采样值选择。
+- `max_threads`：按线程根节点总采样值选取并展开的高占用线程数量，默认 8；无可用自耗热点的线程不会占用名额。
 - `request_timeout_seconds`：Spark 请求超时，默认 60 秒。
 
 当 `llm_providers` 留空时，插件使用当前会话的 AstrBot Provider。配置多个 Provider 时，插件会按列表顺序尝试，第一个成功的结果会被采用。

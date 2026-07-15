@@ -46,6 +46,7 @@ MAX_PROFILE_TREE_NODES = 250000
 
 OPENAI_COMPATIBLE_TEMPLATES = frozenset({"openai_compatible", "modelscope"})
 RESPONSES_API_TEMPLATE = "responses_api"
+CORE_SOURCE_IDS = frozenset({"java", "minecraft", "vanilla", "spark"})
 
 PARSED_MESSAGE_EMOJI_ID = 289
 PARSED_MESSAGE_EMOJI_TYPE = "1"
@@ -74,6 +75,8 @@ class Hotspot:
     global_share: float = 0.0
     thread_name: str = ""
     thread_index: int = -1
+    source_inferred: bool = False
+    context_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -101,32 +104,151 @@ def _config_get(config: object, key: str, default: Any) -> Any:
     return getattr(config, key, default)
 
 
-def _bounded_config_int(
-    config: object,
-    key: str,
+def _bounded_int(
+    value: object,
     default: int,
     minimum: int,
     maximum: int,
 ) -> int:
     try:
-        value = int(_config_get(config, key, default))
+        number = int(value)
     except (TypeError, ValueError):
         return default
-    return min(max(value, minimum), maximum)
+    return min(max(number, minimum), maximum)
 
 
-def _bounded_config_float(
-    config: object,
-    key: str,
+def _bounded_float(
+    value: object,
     default: float,
     minimum: float,
     maximum: float,
 ) -> float:
     try:
-        value = float(_config_get(config, key, default))
+        number = float(value)
     except (TypeError, ValueError):
         return default
-    return min(max(value, minimum), maximum)
+    return min(max(number, minimum), maximum)
+
+
+def _coerce_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _coerce_string_tuple(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)):
+        return (str(value),)
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return (str(value),)
+    return tuple(str(item) for item in value if str(item).strip())
+
+
+def _coerce_provider_tuple(value: object) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(value, Mapping):
+        value = (value,)
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, Mapping))
+
+
+@dataclass(frozen=True)
+class SparkAnalyzeConfig:
+    enabled_group_ids: tuple[str, ...] = ()
+    llm_providers: tuple[Mapping[str, Any], ...] = ()
+    llm_max_tokens: int = DEFAULT_LLM_MAX_TOKENS
+    llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
+    reasoning_effort: str = ""
+    debug_log_llm_response: bool = False
+    max_profile_bytes: int = DEFAULT_MAX_PROFILE_BYTES
+    max_json_bytes: int = DEFAULT_MAX_JSON_BYTES
+    max_summary_chars: int = DEFAULT_MAX_SUMMARY_CHARS
+    max_hotspots: int = DEFAULT_MAX_HOTSPOTS
+    max_threads: int = DEFAULT_MAX_THREADS
+    request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+
+    @classmethod
+    def from_object(cls, raw: object) -> "SparkAnalyzeConfig":
+        if isinstance(raw, cls):
+            return raw
+        return cls(
+            enabled_group_ids=_coerce_string_tuple(
+                _config_get(raw, "enabled_group_ids", [])
+            ),
+            llm_providers=_coerce_provider_tuple(
+                _config_get(raw, "llm_providers", [])
+            ),
+            llm_max_tokens=_bounded_int(
+                _config_get(raw, "llm_max_tokens", DEFAULT_LLM_MAX_TOKENS),
+                DEFAULT_LLM_MAX_TOKENS,
+                256,
+                MAX_LLM_MAX_TOKENS,
+            ),
+            llm_timeout_seconds=_bounded_float(
+                _config_get(
+                    raw,
+                    "llm_timeout_seconds",
+                    DEFAULT_LLM_TIMEOUT_SECONDS,
+                ),
+                DEFAULT_LLM_TIMEOUT_SECONDS,
+                1,
+                MAX_LLM_TIMEOUT_SECONDS,
+            ),
+            reasoning_effort=str(
+                _config_get(raw, "reasoning_effort", "") or ""
+            ).strip(),
+            debug_log_llm_response=_coerce_bool(
+                _config_get(raw, "debug_log_llm_response", False)
+            ),
+            max_profile_bytes=_bounded_int(
+                _config_get(raw, "max_profile_bytes", DEFAULT_MAX_PROFILE_BYTES),
+                DEFAULT_MAX_PROFILE_BYTES,
+                1024,
+                MAX_PROFILE_BYTES,
+            ),
+            max_json_bytes=_bounded_int(
+                _config_get(raw, "max_json_bytes", DEFAULT_MAX_JSON_BYTES),
+                DEFAULT_MAX_JSON_BYTES,
+                1024,
+                MAX_JSON_BYTES,
+            ),
+            max_summary_chars=_bounded_int(
+                _config_get(raw, "max_summary_chars", DEFAULT_MAX_SUMMARY_CHARS),
+                DEFAULT_MAX_SUMMARY_CHARS,
+                1000,
+                MAX_SUMMARY_CHARS,
+            ),
+            max_hotspots=_bounded_int(
+                _config_get(raw, "max_hotspots", DEFAULT_MAX_HOTSPOTS),
+                DEFAULT_MAX_HOTSPOTS,
+                1,
+                MAX_HOTSPOTS,
+            ),
+            max_threads=_bounded_int(
+                _config_get(raw, "max_threads", DEFAULT_MAX_THREADS),
+                DEFAULT_MAX_THREADS,
+                1,
+                MAX_THREADS,
+            ),
+            request_timeout_seconds=_bounded_float(
+                _config_get(
+                    raw,
+                    "request_timeout_seconds",
+                    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                ),
+                DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                1,
+                MAX_REQUEST_TIMEOUT_SECONDS,
+            ),
+        )
 
 
 def is_group_allowed(group_id: object, whitelist: object) -> bool:
@@ -435,6 +557,10 @@ def _node_source(
     return str(class_sources.get(class_name) or "")
 
 
+def _is_core_source(source: str) -> bool:
+    return source.strip().lower() in CORE_SOURCE_IDS
+
+
 def _collect_thread_hotspots(
     thread: Mapping[str, Any],
     class_sources: Mapping[str, Any],
@@ -453,6 +579,9 @@ def _collect_thread_hotspots(
     # once, keep one representative root-to-node path, and derive self time by
     # subtracting the unique direct children from the inclusive node samples.
     paths: dict[int, list[str]] = {}
+    path_sources: dict[int, str] = {}
+    path_non_core_sources: dict[int, str] = {}
+    path_context_counts: dict[int, int] = {}
     queue: list[int] = []
     for root_ref in root_refs:
         if (
@@ -462,6 +591,14 @@ def _collect_thread_hotspots(
             and isinstance(nodes[root_ref], dict)
         ):
             paths[root_ref] = [_node_label(nodes[root_ref])]
+            root_source = _node_source(nodes[root_ref], class_sources)
+            path_sources[root_ref] = root_source
+            path_non_core_sources[root_ref] = (
+                root_source
+                if root_source and not _is_core_source(root_source)
+                else ""
+            )
+            path_context_counts[root_ref] = 1
             queue.append(root_ref)
 
     cursor = 0
@@ -479,14 +616,26 @@ def _collect_thread_hotspots(
                 not isinstance(child_ref, int)
                 or child_ref < 0
                 or child_ref >= len(nodes)
-                or child_ref in paths
                 or not isinstance(nodes[child_ref], dict)
             ):
+                continue
+            if child_ref in paths:
+                path_context_counts[child_ref] = (
+                    path_context_counts.get(child_ref, 1) + 1
+                )
                 continue
             paths[child_ref] = [
                 *paths[ref][-7:],
                 _node_label(nodes[child_ref]),
             ]
+            child_source = _node_source(nodes[child_ref], class_sources)
+            path_sources[child_ref] = child_source or path_sources.get(ref, "")
+            path_non_core_sources[child_ref] = (
+                child_source
+                if child_source and not _is_core_source(child_source)
+                else path_non_core_sources.get(ref, "")
+            )
+            path_context_counts[child_ref] = 1
             queue.append(child_ref)
 
     hotspots: list[Hotspot] = []
@@ -497,12 +646,20 @@ def _collect_thread_hotspots(
         score = _exclusive_times(raw_node, nodes)
         if score <= 0:
             continue
+        direct_source = _node_source(raw_node, class_sources)
+        inferred_source = (
+            path_non_core_sources.get(ref, "")
+            if not direct_source or _is_core_source(direct_source)
+            else ""
+        )
         hotspots.append(
             Hotspot(
                 path=" -> ".join(labels[-8:]),
                 score=score,
                 share=0.0,
-                source=_node_source(raw_node, class_sources),
+                source=direct_source or inferred_source or path_sources.get(ref, ""),
+                source_inferred=bool(inferred_source),
+                context_count=path_context_counts.get(ref, 1),
             )
         )
 
@@ -514,6 +671,8 @@ def _collect_thread_hotspots(
                 score=item.score,
                 share=item.score / thread_total * 100,
                 source=item.source,
+                source_inferred=item.source_inferred,
+                context_count=item.context_count,
             )
             for item in hotspots
         ]
@@ -547,9 +706,9 @@ def _select_representative_hotspots(
     allocations = [0] * len(selected_threads)
     selected_hotspots: list[Hotspot] = []
 
-    # Seed each retained thread with one hotspot, then use a weighted
-    # largest-quotient allocation so dominant threads receive more slots while
-    # smaller but meaningful threads remain represented.
+    # Seed each retained thread with one hotspot, then select the largest
+    # remaining self-sample hotspot globally. This is optimal for sample
+    # coverage after the one-hotspot-per-thread representation constraint.
     for index, thread in enumerate(selected_threads):
         if len(selected_hotspots) >= max_hotspots:
             break
@@ -558,28 +717,31 @@ def _select_representative_hotspots(
 
     while len(selected_hotspots) < max_hotspots:
         best_index: int | None = None
-        best_priority = -1.0
+        best_hotspot: Hotspot | None = None
         for index, thread in enumerate(selected_threads):
             if allocations[index] >= len(thread.hotspots):
                 continue
-            priority = thread.total / (allocations[index] + 1)
+            candidate = thread.hotspots[allocations[index]]
             if (
                 best_index is None
-                or priority > best_priority
+                or best_hotspot is None
+                or candidate.score > best_hotspot.score
                 or (
-                    priority == best_priority
+                    candidate.score == best_hotspot.score
                     and (
                         thread.name,
                         thread.thread_index,
+                        candidate.path,
                     )
                     < (
                         selected_threads[best_index].name,
                         selected_threads[best_index].thread_index,
+                        best_hotspot.path,
                     )
                 )
             ):
                 best_index = index
-                best_priority = priority
+                best_hotspot = candidate
 
         if best_index is None:
             break
@@ -741,6 +903,8 @@ def summarize_spark_profile(
                         source=item.source,
                         thread_name=thread_name,
                         thread_index=thread_index,
+                        source_inferred=item.source_inferred,
+                        context_count=item.context_count,
                     )
                     for item in sorted(
                         thread_hotspots,
@@ -768,6 +932,8 @@ def summarize_spark_profile(
                 ),
                 thread_name=item.thread_name,
                 thread_index=item.thread_index,
+                source_inferred=item.source_inferred,
+                context_count=item.context_count,
             )
             for item in thread.hotspots
         )
@@ -786,6 +952,7 @@ def summarize_spark_profile(
         max_threads=max_threads,
         max_hotspots=max_hotspots,
     )
+    total_self_score = sum(item.score for item in all_hotspots)
     selected_score = sum(item.score for item in selected_hotspots)
 
     lines.append(
@@ -805,8 +972,15 @@ def summarize_spark_profile(
             if total_sample_score > 0
             else 0.0
         )
+        thread_self_score = sum(item.score for item in thread.hotspots)
+        thread_self_coverage = (
+            thread_self_score / thread.total * 100
+            if thread.total > 0
+            else 0.0
+        )
         lines.append(
             f"- {thread.name}: 全局线程采样占比={_format_percent(contribution)}, "
+            f"可解释自耗={_format_percent(thread_self_coverage)}, "
             f"热点配额={selected_quota.get(thread.thread_index, 0)}"
         )
     omitted_threads = [
@@ -816,13 +990,51 @@ def summarize_spark_profile(
     ]
     if omitted_threads:
         omitted_score = sum(thread.total for thread in omitted_threads)
+        omitted_names = ", ".join(thread.name for thread in omitted_threads[:8])
+        if len(omitted_threads) > 8:
+            omitted_names += ", ..."
         lines.append(
             f"- 其余 {len(omitted_threads)} 个线程未展开："
-            f"合计占全局采样 {_format_percent(omitted_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+            f"合计占全局采样 {_format_percent(omitted_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}；"
+            f"线程={omitted_names}"
+        )
+    explainable_coverage = (
+        total_self_score / total_sample_score * 100
+        if total_sample_score > 0
+        else 0.0
+    )
+    selected_self_coverage = (
+        selected_score / total_self_score * 100
+        if total_self_score > 0
+        else 0.0
+    )
+    selected_root_coverage = (
+        selected_score / total_sample_score * 100
+        if total_sample_score > 0
+        else 0.0
+    )
+    uncovered_root_score = max(total_sample_score - total_self_score, 0.0)
+    lines.append(
+        f"- 调用图可解释自耗覆盖线程根采样："
+        f"{_format_percent(explainable_coverage)}"
+        f"（自耗合计={_format_number(total_self_score)}，"
+        f"根采样={_format_number(total_sample_score)}）"
+    )
+    lines.append(
+        f"- 调用图未归属/未覆盖线程根采样："
+        f"{_format_percent(uncovered_root_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+    )
+    overcounted_root_score = max(total_self_score - total_sample_score, 0.0)
+    if overcounted_root_score > 0:
+        lines.append(
+            f"- 调用图自耗合计超过线程根采样："
+            f"{_format_percent(overcounted_root_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+            "；可能存在共享节点或 profile 数据不一致，相关百分比仅供参考"
         )
     lines.append(
-        f"- 已展开热点覆盖全线程自耗采样："
-        f"{_format_percent(selected_score / total_sample_score * 100) if total_sample_score > 0 else '0.00%'}"
+        f"- 已展开热点覆盖可解释自耗："
+        f"{_format_percent(selected_self_coverage)}；"
+        f"覆盖全线程根采样：{_format_percent(selected_root_coverage)}"
     )
     lines.append("")
 
@@ -830,24 +1042,37 @@ def summarize_spark_profile(
         "代表性采样自耗热点（按全局采样占比排序；每个调用树节点只计一次）："
     )
     for index, hotspot in enumerate(selected_hotspots, start=1):
-        source_text = f"，source={hotspot.source}" if hotspot.source else ""
+        source_text = ""
+        if hotspot.source:
+            inferred_text = "（调用链推断）" if hotspot.source_inferred else ""
+            source_text = f"，source={hotspot.source}{inferred_text}"
+        context_text = (
+            f"，共享调用上下文={hotspot.context_count}"
+            if hotspot.context_count > 1
+            else ""
+        )
         lines.append(
             f"{index}. 全局={_format_percent(hotspot.global_share)}，"
             f"线程内={_format_percent(hotspot.share)} "
             f"({_format_number(hotspot.score)}): "
-            f"[{hotspot.thread_name}] {hotspot.path}{source_text}"
+            f"[{hotspot.thread_name}] {hotspot.path}{source_text}{context_text}"
         )
     if not selected_hotspots:
         lines.append("- 未找到可展开的线程采样树")
     lines.append("")
 
     third_party_scores: dict[str, float] = {}
+    third_party_inferred_scores: dict[str, float] = {}
     for hotspot in all_hotspots:
         source = hotspot.source.strip()
-        if source and source.lower() not in {"java", "minecraft", "vanilla"}:
+        if source and not _is_core_source(source):
             third_party_scores[source] = (
                 third_party_scores.get(source, 0.0) + hotspot.score
             )
+            if hotspot.source_inferred:
+                third_party_inferred_scores[source] = (
+                    third_party_inferred_scores.get(source, 0.0) + hotspot.score
+                )
     lines.append("第三方 source 自耗热点聚合：")
     if third_party_scores and total_sample_score > 0:
         for index, (source, score) in enumerate(
@@ -856,12 +1081,22 @@ def summarize_spark_profile(
             ],
             start=1,
         ):
+            inferred_score = third_party_inferred_scores.get(source, 0.0)
+            inferred_text = (
+                f"，其中调用链推断={_format_percent(inferred_score / total_sample_score * 100)}"
+                if inferred_score > 0
+                else ""
+            )
             lines.append(
                 f"{index}. {source}: {_format_percent(score / total_sample_score * 100)} "
-                f"({_format_number(score)})"
+                f"({_format_number(score)}){inferred_text}"
             )
     else:
         lines.append("- 未找到可归属的第三方 source")
+    lines.append(
+        "- source 归属说明：优先使用热点节点自身的 source；叶节点未标注时，"
+        "沿代表性调用链使用最近的非内置 source，并标记为“调用链推断”。"
+    )
 
     return _truncate_text("\n".join(lines), max_chars)
 
@@ -886,11 +1121,17 @@ Spark code：{code}
 5. 优先级建议：给出按优先级排序的排查或优化步骤，尽量具体到可以执行的操作。
 6. 结论边界：说明采样数据无法证明什么，以及还需要哪些数据才能进一步确认。
 
-要求：
-- 不要把采样占比直接写成精确 CPU 百分比。
-- 不要编造摘要中没有出现的 Mod、版本、异常或配置。
-- 区分客户端渲染问题与服务端 tick 问题。
-- 证据不足时明确说“不确定”，不要强行归因。
+    要求：
+    - 不要把采样占比直接写成精确 CPU 百分比。
+    - 不要编造摘要中没有出现的 Mod、版本、异常或配置。
+    - 区分客户端渲染问题与服务端 tick 问题。
+    - 标记为“调用链推断”的 source 只能作为归属线索，不要当作直接证据；
+      结合完整调用路径和采样占比判断。
+    - “共享调用上下文”表示同一调用树节点被多个父路径引用，自耗已去重，
+      不要将它重复相加。
+    - 注意“调用图可解释自耗覆盖”和“已展开热点覆盖”两个指标，
+      未覆盖部分不能被当作不存在性能开销。
+    - 证据不足时明确说“不确定”，不要强行归因。
 
 Spark profile 摘要：
 {summary}
@@ -1002,8 +1243,9 @@ async def _call_openai_compatible(
     client: httpx.AsyncClient,
     prompt: str,
     provider: Mapping[str, Any],
-    config: object,
+    config: SparkAnalyzeConfig,
 ) -> str:
+    config = SparkAnalyzeConfig.from_object(config)
     provider_name = str(provider.get("name") or "OpenAI 兼容 Provider")
     api_key = str(provider.get("api_key") or "").strip()
     base_url = str(provider.get("base_url") or "").strip()
@@ -1014,30 +1256,16 @@ async def _call_openai_compatible(
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": _bounded_config_int(
-            config,
-            "llm_max_tokens",
-            DEFAULT_LLM_MAX_TOKENS,
-            256,
-            MAX_LLM_MAX_TOKENS,
-        ),
+        "max_tokens": config.llm_max_tokens,
     }
-    reasoning_effort = str(_config_get(config, "reasoning_effort", "") or "").strip()
-    if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+    if config.reasoning_effort:
+        payload["reasoning_effort"] = config.reasoning_effort
 
-    timeout_seconds = _bounded_config_float(
-        config,
-        "llm_timeout_seconds",
-        DEFAULT_LLM_TIMEOUT_SECONDS,
-        1,
-        MAX_LLM_TIMEOUT_SECONDS,
-    )
     response = await client.post(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         json=payload,
         headers={"Authorization": f"Bearer {api_key}"},
-        timeout=timeout_seconds,
+        timeout=config.llm_timeout_seconds,
     )
     response.raise_for_status()
     response_data = response.json()
@@ -1048,8 +1276,9 @@ async def _call_openai_compatible(
 async def _call_responses_api(
     prompt: str,
     provider: Mapping[str, Any],
-    config: object,
+    config: SparkAnalyzeConfig,
 ) -> str:
+    config = SparkAnalyzeConfig.from_object(config)
     provider_name = str(provider.get("name") or "Responses API Provider")
     api_key = str(provider.get("api_key") or "").strip()
     configured_base_url = str(provider.get("base_url") or "").strip()
@@ -1057,35 +1286,21 @@ async def _call_responses_api(
     if not api_key or not configured_base_url:
         raise ValueError(f"{provider_name} 缺少 api_key 或 base_url")
 
-    timeout_seconds = _bounded_config_float(
-        config,
-        "llm_timeout_seconds",
-        DEFAULT_LLM_TIMEOUT_SECONDS,
-        1,
-        MAX_LLM_TIMEOUT_SECONDS,
-    )
     request_kwargs: dict[str, Any] = {
         "model": model,
         "input": prompt,
-        "max_output_tokens": _bounded_config_int(
-            config,
-            "llm_max_tokens",
-            DEFAULT_LLM_MAX_TOKENS,
-            256,
-            MAX_LLM_MAX_TOKENS,
-        ),
+        "max_output_tokens": config.llm_max_tokens,
         "stream": True,
     }
-    reasoning_effort = str(_config_get(config, "reasoning_effort", "") or "").strip()
-    if reasoning_effort:
-        request_kwargs["reasoning"] = {"effort": reasoning_effort}
+    if config.reasoning_effort:
+        request_kwargs["reasoning"] = {"effort": config.reasoning_effort}
 
     sdk_client: AsyncOpenAI | None = None
     try:
         sdk_client = AsyncOpenAI(
             api_key=api_key,
             base_url=_normalize_responses_base_url(configured_base_url),
-            timeout=timeout_seconds,
+            timeout=config.llm_timeout_seconds,
             # A connection drop can happen after the upstream already charged
             # the request. Do not let the SDK retry and consume tokens again.
             max_retries=0,
@@ -1119,11 +1334,11 @@ async def generate_analysis(
     context: Context,
     event: AstrMessageEvent,
     prompt: str,
-    config: object,
+    config: SparkAnalyzeConfig,
     client: httpx.AsyncClient,
 ) -> str:
-    configured_providers = _config_get(config, "llm_providers", []) or []
-    providers = list(configured_providers)
+    config = SparkAnalyzeConfig.from_object(config)
+    providers = list(config.llm_providers)
     if not providers:
         providers = [
             {
@@ -1131,7 +1346,7 @@ async def generate_analysis(
                 "name": "AstrBot Provider",
             }
         ]
-        logger.info("[SparkAnalyze] 未配置 Provider 列表，使用当前 AstrBot Provider")
+        logger.debug("[SparkAnalyze] 未配置 Provider 列表，使用当前 AstrBot Provider")
 
     last_error: Exception | None = None
     for provider in providers:
@@ -1142,7 +1357,7 @@ async def generate_analysis(
         provider_name = str(provider.get("name") or "未命名 Provider")
         template = _provider_template(provider)
         try:
-            logger.info(
+            logger.debug(
                 "[SparkAnalyze] 尝试 Provider：name=%s, template=%s",
                 provider_name,
                 template,
@@ -1160,9 +1375,9 @@ async def generate_analysis(
                 )
             else:
                 raise ValueError(f"不支持的 Provider 模板：{template or '未知'}")
-            if _config_get(config, "debug_log_llm_response", False):
-                logger.info("[SparkAnalyze] %s 返回：%s", provider_name, text)
-            logger.info("[SparkAnalyze] Provider 分析成功：%s", provider_name)
+            if config.debug_log_llm_response:
+                logger.debug("[SparkAnalyze] %s 返回：%s", provider_name, text)
+            logger.debug("[SparkAnalyze] Provider 分析成功：%s", provider_name)
             return text
         except Exception as error:
             last_error = error
@@ -1206,7 +1421,7 @@ def _build_forward_nodes(
 class SparkAnalyzePlugin(Star):
     def __init__(self, context: Context, config: object = None):
         super().__init__(context)
-        self.config = config if config is not None else {}
+        self.config: SparkAnalyzeConfig = SparkAnalyzeConfig.from_object(config)
         self._http_client: httpx.AsyncClient | None = None
         self._http_client_lock = asyncio.Lock()
         self._in_flight_codes: set[str] = set()
@@ -1250,8 +1465,7 @@ class SparkAnalyzePlugin(Star):
                 return
 
             group_id = _get_group_id(event)
-            whitelist = _config_get(self.config, "enabled_group_ids", [])
-            if not is_group_allowed(group_id, whitelist):
+            if not is_group_allowed(group_id, self.config.enabled_group_ids):
                 return
 
             messages = _get_message_segments(event)
@@ -1262,7 +1476,7 @@ class SparkAnalyzePlugin(Star):
             if link is None:
                 return
 
-            logger.info(
+            logger.debug(
                 "[SparkAnalyze] 识别到 Spark profile 链接：url=%s, code=%s, group_id=%s",
                 link.url,
                 link.code,
@@ -1272,81 +1486,38 @@ class SparkAnalyzePlugin(Star):
             await _react_to_parsed_message(event)
 
             if not await self._claim_code(link.code):
-                logger.info(
+                logger.debug(
                     "[SparkAnalyze] code 已在分析中，跳过重复任务：code=%s",
                     link.code,
                 )
                 return
 
             try:
-                max_profile_bytes = _bounded_config_int(
-                    self.config,
-                    "max_profile_bytes",
-                    DEFAULT_MAX_PROFILE_BYTES,
-                    1024,
-                    MAX_PROFILE_BYTES,
-                )
-                max_json_bytes = _bounded_config_int(
-                    self.config,
-                    "max_json_bytes",
-                    DEFAULT_MAX_JSON_BYTES,
-                    1024,
-                    MAX_JSON_BYTES,
-                )
-                max_summary_chars = _bounded_config_int(
-                    self.config,
-                    "max_summary_chars",
-                    DEFAULT_MAX_SUMMARY_CHARS,
-                    1000,
-                    MAX_SUMMARY_CHARS,
-                )
-                max_hotspots = _bounded_config_int(
-                    self.config,
-                    "max_hotspots",
-                    DEFAULT_MAX_HOTSPOTS,
-                    1,
-                    MAX_HOTSPOTS,
-                )
-                max_threads = _bounded_config_int(
-                    self.config,
-                    "max_threads",
-                    DEFAULT_MAX_THREADS,
-                    1,
-                    MAX_THREADS,
-                )
-                request_timeout_seconds = _bounded_config_float(
-                    self.config,
-                    "request_timeout_seconds",
-                    DEFAULT_REQUEST_TIMEOUT_SECONDS,
-                    1,
-                    MAX_REQUEST_TIMEOUT_SECONDS,
-                )
-
                 client = await self._get_http_client()
                 raw_profile = await fetch_spark_profile(
                     link.code,
-                    max_bytes=max_profile_bytes,
-                    timeout_seconds=request_timeout_seconds,
+                    max_bytes=self.config.max_profile_bytes,
+                    timeout_seconds=self.config.request_timeout_seconds,
                     client=client,
                 )
                 if not raw_profile:
                     raise SparkFetchError("Spark profile 响应为空")
-                logger.info(
+                logger.debug(
                     "[SparkAnalyze] 已下载 Spark profile：code=%s, bytes=%s",
                     link.code,
                     len(raw_profile),
                 )
                 profile = await fetch_spark_json(
                     link.code,
-                    max_bytes=max_json_bytes,
-                    timeout_seconds=request_timeout_seconds,
+                    max_bytes=self.config.max_json_bytes,
+                    timeout_seconds=self.config.request_timeout_seconds,
                     client=client,
                 )
                 summary = summarize_spark_profile(
                     profile,
-                    max_hotspots=max_hotspots,
-                    max_chars=max_summary_chars,
-                    max_threads=max_threads,
+                    max_hotspots=self.config.max_hotspots,
+                    max_chars=self.config.max_summary_chars,
+                    max_threads=self.config.max_threads,
                 )
                 sender = _sender_text(event)
                 prompt = build_analysis_prompt(

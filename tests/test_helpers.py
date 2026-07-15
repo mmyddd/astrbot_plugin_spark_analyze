@@ -40,6 +40,10 @@ def _stub_astrbot_modules() -> None:
 
     class _Logger:
         @staticmethod
+        def debug(*_args, **_kwargs):
+            return None
+
+        @staticmethod
         def info(*_args, **_kwargs):
             return None
 
@@ -454,6 +458,40 @@ class HelperTests(unittest.TestCase):
         self.assertFalse(main.is_group_allowed("12345", []))
         self.assertFalse(main.is_group_allowed("99999", ["12345"]))
 
+    def test_config_parses_and_bounds_values_once(self):
+        config = main.SparkAnalyzeConfig.from_object(
+            {
+                "enabled_group_ids": [12345, "67890"],
+                "llm_providers": [
+                    {"name": "Primary", "__template_key": "astrbot_provider"},
+                    "invalid",
+                ],
+                "llm_max_tokens": 999999,
+                "llm_timeout_seconds": "0",
+                "reasoning_effort": " high ",
+                "debug_log_llm_response": "true",
+                "max_profile_bytes": 1,
+                "max_json_bytes": 999999999,
+                "max_summary_chars": 1,
+                "max_hotspots": 0,
+                "max_threads": 999,
+                "request_timeout_seconds": "12.5",
+            }
+        )
+
+        self.assertEqual(config.enabled_group_ids, ("12345", "67890"))
+        self.assertEqual(len(config.llm_providers), 1)
+        self.assertEqual(config.llm_max_tokens, main.MAX_LLM_MAX_TOKENS)
+        self.assertEqual(config.llm_timeout_seconds, 1)
+        self.assertEqual(config.reasoning_effort, "high")
+        self.assertTrue(config.debug_log_llm_response)
+        self.assertEqual(config.max_profile_bytes, 1024)
+        self.assertEqual(config.max_json_bytes, main.MAX_JSON_BYTES)
+        self.assertEqual(config.max_summary_chars, 1000)
+        self.assertEqual(config.max_hotspots, 1)
+        self.assertEqual(config.max_threads, main.MAX_THREADS)
+        self.assertEqual(config.request_timeout_seconds, 12.5)
+
     def test_fetch_spark_profile_validates_content_type_and_reads_bytes(self):
         client = FakeHttpClient(
             FakeResponse(b"profile", main.SPARK_PROFILE_CONTENT_TYPE)
@@ -592,6 +630,7 @@ class HelperTests(unittest.TestCase):
         )
 
         self.assertEqual(summary.count("mod.Leaf.leaf"), 1)
+        self.assertIn("共享调用上下文=2", summary)
         self.assertIn("sharedmod: 100.00%", summary)
 
     def test_select_representative_hotspots_weights_slots_by_thread_samples(self):
@@ -623,6 +662,36 @@ class HelperTests(unittest.TestCase):
             {"High": 4, "Medium": 1, "Low": 1},
         )
 
+    def test_select_representative_hotspots_maximizes_remaining_sample_coverage(self):
+        summaries = [
+            thread_hotspot_summary(0, "High diffuse", 100, [5, 5, 5, 5]),
+            thread_hotspot_summary(1, "Medium concentrated", 40, [20, 10]),
+            thread_hotspot_summary(2, "Low", 20, [10]),
+        ]
+
+        selected_threads, selected_hotspots = (
+            main._select_representative_hotspots(
+                summaries,
+                max_threads=3,
+                max_hotspots=5,
+            )
+        )
+
+        self.assertEqual(
+            [thread.name for thread in selected_threads],
+            ["High diffuse", "Medium concentrated", "Low"],
+        )
+        self.assertEqual(sum(hotspot.score for hotspot in selected_hotspots), 50)
+        self.assertEqual(
+            {
+                name: sum(
+                    hotspot.thread_name == name for hotspot in selected_hotspots
+                )
+                for name in ("High diffuse", "Medium concentrated", "Low")
+            },
+            {"High diffuse": 2, "Medium concentrated": 2, "Low": 1},
+        )
+
     def test_select_representative_hotspots_limits_threads_and_skips_empty_threads(
         self,
     ):
@@ -647,6 +716,92 @@ class HelperTests(unittest.TestCase):
             {"High", "Low"},
         )
 
+    def test_collect_hotspot_infers_source_from_call_path(self):
+        thread = {
+            "name": "Render thread",
+            "times": [100],
+            "childrenRefs": [0],
+            "children": [
+                {
+                    "className": "com.example.ModEntry",
+                    "methodName": "render",
+                    "times": [100],
+                    "childrenRefs": [1],
+                },
+                {
+                    "className": "net.minecraft.Render",
+                    "methodName": "draw",
+                    "times": [100],
+                    "childrenRefs": [2],
+                },
+                {
+                    "className": "org.lwjgl.opengl.GL",
+                    "methodName": "nativeDraw",
+                    "times": [100],
+                    "childrenRefs": [],
+                },
+            ],
+        }
+
+        hotspots, total = main._collect_thread_hotspots(
+            thread,
+            {
+                "com.example.ModEntry": "testmod",
+                "net.minecraft.Render": "minecraft",
+            },
+        )
+
+        self.assertEqual(total, 100)
+        self.assertEqual(len(hotspots), 1)
+        self.assertEqual(hotspots[0].source, "testmod")
+        self.assertTrue(hotspots[0].source_inferred)
+
+    def test_summary_reports_inferred_source_and_accounting_coverage(self):
+        profile = sample_profile()
+        profile["classSources"] = {
+            "com.example.ModEntry": "testmod",
+            "net.minecraft.Render": "minecraft",
+        }
+        profile["threads"] = [
+            {
+                "name": "Render thread",
+                "times": [100],
+                "childrenRefs": [0],
+                "children": [
+                    {
+                        "className": "com.example.ModEntry",
+                        "methodName": "render",
+                        "times": [100],
+                        "childrenRefs": [1],
+                    },
+                    {
+                        "className": "net.minecraft.Render",
+                        "methodName": "draw",
+                        "times": [100],
+                        "childrenRefs": [2],
+                    },
+                    {
+                        "className": "org.lwjgl.opengl.GL",
+                        "methodName": "nativeDraw",
+                        "times": [100],
+                        "childrenRefs": [],
+                    },
+                ],
+            }
+        ]
+
+        summary = main.summarize_spark_profile(
+            profile,
+            max_hotspots=1,
+            max_threads=1,
+            max_chars=10000,
+        )
+
+        self.assertIn("source=testmod（调用链推断）", summary)
+        self.assertIn("调用图可解释自耗覆盖线程根采样：100.00%", summary)
+        self.assertIn("已展开热点覆盖可解释自耗：100.00%", summary)
+        self.assertIn("其中调用链推断=100.00%", summary)
+
     def test_summarize_profile_reports_thread_trimming_and_coverage(self):
         profile = sample_profile()
         profile["classSources"] = {}
@@ -664,18 +819,21 @@ class HelperTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "High: 全局线程采样占比=66.67%, 热点配额=3",
+            "High: 全局线程采样占比=66.67%, 可解释自耗=100.00%, 热点配额=3",
             summary,
         )
         self.assertIn(
-            "Medium: 全局线程采样占比=26.67%, 热点配额=1",
+            "Medium: 全局线程采样占比=26.67%, 可解释自耗=100.00%, 热点配额=1",
             summary,
         )
         self.assertIn(
             "其余 1 个线程未展开：合计占全局采样 6.67%",
             summary,
         )
-        self.assertIn("已展开热点覆盖全线程自耗采样：86.67%", summary)
+        self.assertIn(
+            "已展开热点覆盖可解释自耗：86.67%；覆盖全线程根采样：86.67%",
+            summary,
+        )
         self.assertNotIn("[Low]", summary)
 
     def test_analysis_prompt_requires_evidence_and_limits_hallucination(self):
@@ -688,13 +846,16 @@ class HelperTests(unittest.TestCase):
 
         self.assertIn("总体结论", prompt)
         self.assertIn("不要编造", prompt)
+        self.assertIn("调用链推断", prompt)
+        self.assertIn("共享调用上下文", prompt)
+        self.assertIn("未覆盖部分不能被当作不存在性能开销", prompt)
         self.assertIn("summary text", prompt)
         self.assertIn("abc123", prompt)
 
     def test_handler_logs_stops_reacts_and_uses_current_provider(self):
         original_fetch_profile = main.fetch_spark_profile
         original_fetch_json = main.fetch_spark_json
-        original_info = main.logger.info
+        original_debug = main.logger.debug
         calls = []
         order = []
         logs = []
@@ -714,12 +875,12 @@ class HelperTests(unittest.TestCase):
 
         main.fetch_spark_profile = fake_fetch_profile
         main.fetch_spark_json = fake_fetch_json
-        main.logger.info = capture_info
+        main.logger.debug = capture_info
         self.addCleanup(
             lambda: setattr(main, "fetch_spark_profile", original_fetch_profile)
         )
         self.addCleanup(lambda: setattr(main, "fetch_spark_json", original_fetch_json))
-        self.addCleanup(lambda: setattr(main.logger, "info", original_info))
+        self.addCleanup(lambda: setattr(main.logger, "debug", original_debug))
 
         context = FakeContext()
         plugin = main.SparkAnalyzePlugin(
@@ -966,10 +1127,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(context.provider_calls, ["umo://group/12345"])
 
     def test_debug_log_llm_response_applies_to_astrbot_provider(self):
-        original_info = main.logger.info
+        original_debug = main.logger.debug
         logs = []
-        main.logger.info = lambda *args, **kwargs: logs.append((args, kwargs))
-        self.addCleanup(lambda: setattr(main.logger, "info", original_info))
+        main.logger.debug = lambda *args, **kwargs: logs.append((args, kwargs))
+        self.addCleanup(lambda: setattr(main.logger, "debug", original_debug))
 
         result = asyncio.run(
             main.generate_analysis(
