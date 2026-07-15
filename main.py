@@ -799,8 +799,6 @@ async def _call_openai_compatible(
     response.raise_for_status()
     response_data = response.json()
     text = _extract_provider_text(response_data, provider_name)
-    if _config_get(config, "debug_log_llm_response", False):
-        logger.info("[SparkAnalyze] %s 返回：%s", provider_name, text)
     return text
 
 
@@ -865,6 +863,8 @@ async def generate_analysis(
                 )
             else:
                 raise ValueError(f"不支持的 Provider 模板：{template or '未知'}")
+            if _config_get(config, "debug_log_llm_response", False):
+                logger.info("[SparkAnalyze] %s 返回：%s", provider_name, text)
             logger.info("[SparkAnalyze] Provider 分析成功：%s", provider_name)
             return text
         except Exception as error:

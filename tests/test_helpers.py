@@ -296,6 +296,11 @@ class FakeHttpClient:
         return FakeStream(self.response)
 
 
+class ErrorHttpClient:
+    def stream(self, method, url, **kwargs):
+        raise main.httpx.ConnectError("network unavailable")
+
+
 class FakePostResponse:
     def raise_for_status(self):
         return None
@@ -396,6 +401,21 @@ class HelperTests(unittest.TestCase):
             asyncio.run(
                 main.fetch_spark_profile("abc123", client=client, max_bytes=5)
             )
+
+    def test_fetch_spark_json_rejects_oversized_payload(self):
+        response = FakeResponse(
+            b"0123456789",
+            main.SPARK_JSON_CONTENT_TYPE,
+        )
+        response.url = types.SimpleNamespace(host="spark-json-service.lucko.me")
+        client = FakeHttpClient(response)
+
+        with self.assertRaises(main.SparkDataTooLarge):
+            asyncio.run(main.fetch_spark_json("abc123", client=client, max_bytes=5))
+
+    def test_fetch_spark_profile_wraps_network_error(self):
+        with self.assertRaises(main.SparkFetchError):
+            asyncio.run(main.fetch_spark_profile("abc123", client=ErrorHttpClient()))
 
     def test_summarize_profile_rebuilds_refs_and_reports_source(self):
         summary = main.summarize_spark_profile(
@@ -590,6 +610,97 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(len(context.generate_calls), 1)
 
+    def test_handler_ignores_mixed_message(self):
+        context = FakeContext()
+        plugin = main.SparkAnalyzePlugin(
+            context,
+            {"enabled_group_ids": ["12345"]},
+        )
+        event = FakeEvent(
+            [
+                Comp.Plain("https://spark.lucko.me/abc123"),
+                types.SimpleNamespace(text="image"),
+            ],
+        )
+
+        results = collect_async_generator(plugin.on_group_message(event))
+
+        self.assertEqual(results, [])
+        self.assertFalse(event.stopped)
+        self.assertEqual(event.bot.emoji_like_calls, [])
+        asyncio.run(plugin.terminate())
+
+    def test_handler_continues_without_message_id(self):
+        original_fetch_profile = main.fetch_spark_profile
+        original_fetch_json = main.fetch_spark_json
+
+        async def fake_fetch_profile(code, **kwargs):
+            return b"profile"
+
+        async def fake_fetch_json(code, **kwargs):
+            return sample_profile()
+
+        main.fetch_spark_profile = fake_fetch_profile
+        main.fetch_spark_json = fake_fetch_json
+        self.addCleanup(
+            lambda: setattr(main, "fetch_spark_profile", original_fetch_profile)
+        )
+        self.addCleanup(lambda: setattr(main, "fetch_spark_json", original_fetch_json))
+
+        plugin = main.SparkAnalyzePlugin(
+            FakeContext(),
+            {"enabled_group_ids": ["12345"]},
+        )
+        event = FakeEvent(
+            [Comp.Plain("https://spark.lucko.me/abc123")],
+            message_id=None,
+        )
+
+        results = collect_async_generator(plugin.on_group_message(event))
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(event.stopped)
+        self.assertEqual(event.bot.emoji_like_calls, [])
+        asyncio.run(plugin.terminate())
+
+    def test_handler_releases_code_after_analysis_failure(self):
+        original_fetch_profile = main.fetch_spark_profile
+        original_fetch_json = main.fetch_spark_json
+        calls = []
+
+        async def fake_fetch_profile(code, **kwargs):
+            calls.append(("profile", code))
+            return b"profile"
+
+        async def failing_fetch_json(code, **kwargs):
+            calls.append(("json", code))
+            if len([item for item in calls if item[0] == "json"]) == 1:
+                raise main.SparkFetchError("invalid profile")
+            return sample_profile()
+
+        main.fetch_spark_profile = fake_fetch_profile
+        main.fetch_spark_json = failing_fetch_json
+        self.addCleanup(
+            lambda: setattr(main, "fetch_spark_profile", original_fetch_profile)
+        )
+        self.addCleanup(lambda: setattr(main, "fetch_spark_json", original_fetch_json))
+
+        context = FakeContext()
+        plugin = main.SparkAnalyzePlugin(
+            context,
+            {"enabled_group_ids": ["12345"]},
+        )
+
+        first_event = FakeEvent([Comp.Plain("https://spark.lucko.me/abc123")])
+        first_results = collect_async_generator(plugin.on_group_message(first_event))
+        second_event = FakeEvent([Comp.Plain("https://spark.lucko.me/abc123")])
+        second_results = collect_async_generator(plugin.on_group_message(second_event))
+
+        self.assertEqual(first_results, [])
+        self.assertEqual(len(second_results), 1)
+        self.assertNotIn("abc123", plugin._in_flight_codes)
+        asyncio.run(plugin.terminate())
+
     def test_handler_denies_unlisted_group_without_network_or_reaction(self):
         context = FakeContext()
         plugin = main.SparkAnalyzePlugin(context, {"enabled_group_ids": []})
@@ -675,6 +786,35 @@ class HelperTests(unittest.TestCase):
 
         self.assertIn("性能分析结果", result)
         self.assertEqual(context.provider_calls, ["umo://group/12345"])
+
+    def test_debug_log_llm_response_applies_to_astrbot_provider(self):
+        original_info = main.logger.info
+        logs = []
+        main.logger.info = lambda *args, **kwargs: logs.append((args, kwargs))
+        self.addCleanup(lambda: setattr(main.logger, "info", original_info))
+
+        result = asyncio.run(
+            main.generate_analysis(
+                FakeContext(),
+                FakeEvent([]),
+                "prompt",
+                {
+                    "debug_log_llm_response": True,
+                    "llm_providers": [
+                        {
+                            "__template_key": "astrbot_provider",
+                            "name": "Current",
+                        }
+                    ],
+                },
+                types.SimpleNamespace(),
+            )
+        )
+
+        self.assertIn("性能分析结果", result)
+        self.assertTrue(
+            any("性能分析结果" in str(args) for args, _ in logs)
+        )
 
     def test_provider_falls_back_when_template_is_unknown(self):
         context = FakeContext()
