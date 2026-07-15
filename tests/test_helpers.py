@@ -789,6 +789,42 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(hotspots[0].source, "testmod")
         self.assertTrue(hotspots[0].source_inferred)
 
+        nested_thread = {
+            "name": "Render thread",
+            "times": [100],
+            "childrenRefs": [0],
+            "children": [
+                {
+                    "className": "com.alpha.Root",
+                    "methodName": "render",
+                    "times": [100],
+                    "childrenRefs": [1],
+                },
+                {
+                    "className": "com.beta.Inner",
+                    "methodName": "render",
+                    "times": [100],
+                    "childrenRefs": [2],
+                },
+                {
+                    "className": "org.lwjgl.opengl.GL",
+                    "methodName": "nativeDraw",
+                    "times": [100],
+                    "childrenRefs": [],
+                },
+            ],
+        }
+        nested_hotspots, _ = main._collect_thread_hotspots(
+            nested_thread,
+            {
+                "com.alpha.Root": "alpha",
+                "com.beta.Inner": "beta",
+            },
+        )
+        self.assertEqual(nested_hotspots[0].source, "beta")
+        self.assertEqual(nested_hotspots[0].source_candidates, ())
+        self.assertTrue(nested_hotspots[0].source_inferred)
+
         core_only_thread = {
             "name": "Render thread",
             "times": [100],

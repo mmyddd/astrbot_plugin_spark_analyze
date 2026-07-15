@@ -629,9 +629,10 @@ def _collect_thread_hotspots(
             is_new_edge = edge_key not in seen_edges
             seen_edges.add(edge_key)
             child_source = _node_source(nodes[child_ref], class_sources)
-            incoming_sources = set(path_non_core_sources.get(ref, set()))
             if child_source and not _is_core_source(child_source):
-                incoming_sources.add(child_source)
+                incoming_sources = {child_source}
+            else:
+                incoming_sources = set(path_non_core_sources.get(ref, set()))
             if child_ref in paths:
                 if is_new_edge:
                     path_context_counts[child_ref] = (
@@ -1623,7 +1624,8 @@ class SparkAnalyzePlugin(Star):
                     timeout_seconds=self.config.request_timeout_seconds,
                     client=client,
                 )
-                summary = summarize_spark_profile(
+                summary = await asyncio.to_thread(
+                    summarize_spark_profile,
                     profile,
                     max_hotspots=self.config.max_hotspots,
                     max_chars=self.config.max_summary_chars,

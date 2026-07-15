@@ -139,7 +139,7 @@
     "description": "完整 Spark JSON 的最大读取字节数。",
     "type": "int",
     "default": 10485760,
-    "hint": "默认 10 MiB，插件内部上限 50 MiB。"
+    "hint": "默认 10 MiB，插件内部上限 50 MiB；线程数上限 512。"
   },
   "max_summary_chars": {
     "description": "送入 LLM 的 Spark 摘要最大字符数。",

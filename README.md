@@ -31,7 +31,7 @@ https://spark.lucko.me/02pGFymGbD
 - `reasoning_effort`：可选的 `reasoning_effort` 参数。
 - `debug_log_llm_response`：是否将 LLM 返回文本写入 debug 日志；常规识别、下载、Provider 尝试和成功日志也使用 debug，Provider 失败和处理异常仍使用 warning/error。
 - `max_profile_bytes`：原始 profile 大小上限，默认 20 MiB。
-- `max_json_bytes`：完整 JSON 大小上限，默认 10 MiB。
+- `max_json_bytes`：完整 JSON 大小上限，默认 10 MiB；插件内部最多处理 512 个线程。
 - `max_summary_chars`：发送给 LLM 的摘要字符上限，默认 60000。
 - `max_hotspots`：保留的热点数量，默认 20；先保证每个选中线程有代表热点，剩余名额按全局自耗采样值选择。
 - `max_threads`：最多参与摘要的线程数量，默认 8；选择器在该上限和 `max_hotspots` 上限下联合最大化可解释自耗采样，无可用自耗热点的线程不会占用名额。
