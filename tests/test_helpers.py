@@ -897,6 +897,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(instance.kwargs["api_key"], "test-key")
         self.assertEqual(instance.kwargs["base_url"], "https://example.com/v1")
         self.assertEqual(instance.kwargs["timeout"], 30.0)
+        self.assertEqual(instance.kwargs["max_retries"], 0)
         self.assertTrue(instance.closed)
         self.assertEqual(
             instance.calls,

@@ -881,6 +881,9 @@ async def _call_responses_api(
             api_key=api_key,
             base_url=_normalize_responses_base_url(configured_base_url),
             timeout=timeout_seconds,
+            # A connection drop can happen after the upstream already charged
+            # the request. Do not let the SDK retry and consume tokens again.
+            max_retries=0,
         )
         response = await sdk_client.responses.create(**request_kwargs)
         return _extract_responses_text(response, provider_name)
