@@ -30,6 +30,7 @@ DEFAULT_MAX_JSON_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_SUMMARY_CHARS = 60000
 DEFAULT_MAX_HOTSPOTS = 20
 DEFAULT_MAX_THREADS = 8
+DEFAULT_MAX_CONCURRENT_ANALYSES = 2
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
 DEFAULT_LLM_TIMEOUT_SECONDS = 120
 DEFAULT_LLM_MAX_TOKENS = 4096
@@ -39,6 +40,7 @@ MAX_JSON_BYTES = 50 * 1024 * 1024
 MAX_SUMMARY_CHARS = 200000
 MAX_HOTSPOTS = 100
 MAX_THREADS = 64
+MAX_CONCURRENT_ANALYSES = 8
 MAX_REQUEST_TIMEOUT_SECONDS = 300
 MAX_LLM_TIMEOUT_SECONDS = 600
 MAX_LLM_MAX_TOKENS = 32768
@@ -175,6 +177,7 @@ class SparkAnalyzeConfig:
     max_summary_chars: int = DEFAULT_MAX_SUMMARY_CHARS
     max_hotspots: int = DEFAULT_MAX_HOTSPOTS
     max_threads: int = DEFAULT_MAX_THREADS
+    max_concurrent_analyses: int = DEFAULT_MAX_CONCURRENT_ANALYSES
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
 
     @classmethod
@@ -239,6 +242,16 @@ class SparkAnalyzeConfig:
                 DEFAULT_MAX_THREADS,
                 1,
                 MAX_THREADS,
+            ),
+            max_concurrent_analyses=_bounded_int(
+                _config_get(
+                    raw,
+                    "max_concurrent_analyses",
+                    DEFAULT_MAX_CONCURRENT_ANALYSES,
+                ),
+                DEFAULT_MAX_CONCURRENT_ANALYSES,
+                1,
+                MAX_CONCURRENT_ANALYSES,
             ),
             request_timeout_seconds=_bounded_float(
                 _config_get(
@@ -1538,6 +1551,9 @@ class SparkAnalyzePlugin(Star):
         self._in_flight_codes: set[str] = set()
         self._in_flight_lock = asyncio.Lock()
         self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._analysis_semaphore = asyncio.Semaphore(
+            self.config.max_concurrent_analyses
+        )
         self._terminating = False
 
     async def initialize(self) -> None:
@@ -1603,7 +1619,10 @@ class SparkAnalyzePlugin(Star):
                 )
                 return
 
+            analysis_slot_acquired = False
             try:
+                await self._analysis_semaphore.acquire()
+                analysis_slot_acquired = True
                 client = await self._get_http_client()
                 raw_profile = await fetch_spark_profile(
                     link.code,
@@ -1658,6 +1677,8 @@ class SparkAnalyzePlugin(Star):
                 )
                 return
             finally:
+                if analysis_slot_acquired:
+                    self._analysis_semaphore.release()
                 await self._release_code(link.code)
         except Exception:
             logger.exception(

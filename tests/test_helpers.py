@@ -475,6 +475,7 @@ class HelperTests(unittest.TestCase):
                 "max_summary_chars": 1,
                 "max_hotspots": 0,
                 "max_threads": 999,
+                "max_concurrent_analyses": 999,
                 "request_timeout_seconds": "12.5",
             }
         )
@@ -490,6 +491,10 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(config.max_summary_chars, 1000)
         self.assertEqual(config.max_hotspots, 1)
         self.assertEqual(config.max_threads, main.MAX_THREADS)
+        self.assertEqual(
+            config.max_concurrent_analyses,
+            main.MAX_CONCURRENT_ANALYSES,
+        )
         self.assertEqual(config.request_timeout_seconds, 12.5)
 
     def test_fetch_spark_profile_validates_content_type_and_reads_bytes(self):
@@ -1077,6 +1082,23 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("性能分析结果", results[0][0].nodes[1].kwargs["content"][0].text)
         self.assertTrue(any("识别到 Spark profile 链接" in args[0] for args, _ in logs))
+
+    def test_plugin_limits_concurrent_analysis_slots(self):
+        plugin = main.SparkAnalyzePlugin(
+            FakeContext(),
+            {"max_concurrent_analyses": 1},
+        )
+
+        async def exercise():
+            await plugin._analysis_semaphore.acquire()
+            waiting = asyncio.create_task(plugin._analysis_semaphore.acquire())
+            await asyncio.sleep(0)
+            self.assertFalse(waiting.done())
+            plugin._analysis_semaphore.release()
+            await waiting
+            plugin._analysis_semaphore.release()
+
+        asyncio.run(exercise())
 
     def test_handler_continues_when_reaction_fails(self):
         original_fetch_profile = main.fetch_spark_profile

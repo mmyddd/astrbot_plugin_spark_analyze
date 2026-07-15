@@ -159,6 +159,12 @@
     "default": 8,
     "hint": "与热点数量联合优化可解释自耗采样，插件内部上限 64。"
   },
+  "max_concurrent_analyses": {
+    "description": "同时进行的 Spark 分析任务数量。",
+    "type": "int",
+    "default": 2,
+    "hint": "用于限制 CPU、内存和线程池压力，插件内部上限 8。"
+  },
   "request_timeout_seconds": {
     "description": "Spark 原始 profile 和 JSON service 请求超时时间，单位为秒。",
     "type": "float",
